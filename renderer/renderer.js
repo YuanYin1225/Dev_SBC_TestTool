@@ -379,8 +379,14 @@ function handleSerialData(data) {
     detail = `故障灯状态: ${status}`;
   } else if (parsed.type === 'text' && parsed.text) {
     const crcInfo = parsed.crcOk ? ' ✓' : ' ⚠CRC';
-    document.getElementById('fwVersion').textContent = parsed.text + crcInfo;
-    detail = `固件版本: ${parsed.text}${crcInfo}`;
+    const isFW = (parsed.source === 'firmware');
+    if (isFW) {
+      // 仅固件版本响应才更新版本显示
+      document.getElementById('fwVersion').textContent = parsed.text + crcInfo;
+      detail = `固件版本: ${parsed.text}${crcInfo}`;
+    } else {
+      detail = `文本响应: ${parsed.text}${crcInfo}`;
+    }
   }
 
   if (!parsed.crcOk && parsed.type !== 'unknown') {
@@ -629,6 +635,8 @@ function cancelGenerate() {
 }
 
 // ========== Batch Send (hold-repeat-gap cycle) ==========
+const MAX_BATCH_LOAD = 100000;    // CSV 加载内存上限（条）
+const CSV_CHUNK_SIZE = 8000;      // 分片解析行数，避免阻塞 UI
 let batchCommands = [];
 let batchIndex = 0;
 let batchPaused = false;
@@ -636,6 +644,7 @@ let batchHoldTimer = null;     // 保持阶段重复发送定时器
 let batchHoldStart = 0;        // 当前保持阶段起始时间
 let batchHoldCount = 0;        // 当前保持阶段已发送次数
 let batchInGap = false;        // 是否在间隔等待中
+let csvLoadCancelled = false;
 
 function parseHexLine(line) {
   // Parse a hex string like "55 AA 00 09 00 00 00 30 38" into byte array
@@ -645,91 +654,176 @@ function parseHexLine(line) {
   return bytes;
 }
 
-function parseCSVContent(text) {
-  const commands = [];
-  const lines = text.split(/\r?\n/);
-  // Detect header
-  let startIdx = 0;
-  if (lines[0] && lines[0].includes('完整指令')) startIdx = 1;
+/** Extract hex string from a single CSV line. Returns null if no valid hex found. */
+function extractHexFromLine(line) {
+  if (!line.includes(',')) return line.trim();
 
-  for (let i = startIdx; i < lines.length; i++) {
-    const line = lines[i].trim();
-    if (!line) continue;
-
-    // Try to extract hex from CSV columns (last column)
-    let hexStr = '';
-    if (line.includes(',')) {
-      const cols = line.split(',');
-      // Find the hex column (looks like "55 AA ..." or "55,AA,...")
-      for (const col of cols) {
-        const cleaned = col.replace(/"/g, '').trim();
-        if (/^[0-9A-Fa-f]{2}([\s,][0-9A-Fa-f]{2})+$/.test(cleaned)) {
-          hexStr = cleaned.replace(/,/g, ' ');
-          break;
-        }
-      }
-      // If not found, try the last column
-      if (!hexStr) {
-        const lastCol = cols[cols.length - 1].replace(/"/g, '').trim();
-        if (/^[0-9A-Fa-f]{2}(\s[0-9A-Fa-f]{2})+$/.test(lastCol)) {
-          hexStr = lastCol;
-        }
-      }
-    } else {
-      hexStr = line;
-    }
-
-    if (hexStr) {
-      const bytes = parseHexLine(hexStr);
-      if (bytes) {
-        commands.push({ hex: formatHex(bytes), bytes: bytes });
-      }
+  const cols = line.split(',');
+  // Find the hex column (looks like "55 AA ..." or "55,AA,...")
+  for (const col of cols) {
+    const cleaned = col.replace(/"/g, '').trim();
+    if (/^[0-9A-Fa-f]{2}([\s,][0-9A-Fa-f]{2})+$/.test(cleaned)) {
+      return cleaned.replace(/,/g, ' ');
     }
   }
-  return commands;
+  // If not found, try the last column
+  const lastCol = cols[cols.length - 1].replace(/"/g, '').trim();
+  if (/^[0-9A-Fa-f]{2}(\s[0-9A-Fa-f]{2})+$/.test(lastCol)) {
+    return lastCol;
+  }
+  return null;
+}
+
+/**
+ * 分片异步解析 CSV，不阻塞 UI。
+ * 每片 CSV_CHUNK_SIZE 行，用 setTimeout 让出主线程。
+ */
+function parseCSVChunked(text, onComplete, onProgress) {
+  const lines = text.split(/\r?\n/);
+  let startIdx = (lines[0] && lines[0].includes('完整指令')) ? 1 : 0;
+  const totalLines = lines.length - startIdx;
+  const commands = [];
+  let cursor = startIdx;
+  let truncated = false;
+
+  function processChunk() {
+    if (csvLoadCancelled) {
+      onComplete(commands, totalLines, true);
+      return;
+    }
+
+    const chunkEnd = Math.min(cursor + CSV_CHUNK_SIZE, lines.length);
+    for (let i = cursor; i < chunkEnd; i++) {
+      const line = lines[i].trim();
+      if (!line) continue;
+
+      const hexStr = extractHexFromLine(line);
+      if (hexStr) {
+        const bytes = parseHexLine(hexStr);
+        if (bytes) {
+          if (commands.length >= MAX_BATCH_LOAD) {
+            truncated = true;
+            break;
+          }
+          commands.push({ hex: formatHex(bytes), bytes: bytes });
+        }
+      }
+    }
+
+    cursor = chunkEnd;
+
+    if (truncated || commands.length >= MAX_BATCH_LOAD) {
+      truncated = true;
+      onComplete(commands, totalLines, truncated);
+      return;
+    }
+
+    if (cursor < lines.length) {
+      const pct = Math.round((cursor - startIdx) / totalLines * 100);
+      if (onProgress) onProgress(pct, commands.length);
+      setTimeout(processChunk, 0);  // 让出主线程
+    } else {
+      onComplete(commands, totalLines, false);
+    }
+  }
+
+  setTimeout(processChunk, 0);
 }
 
 function loadCSVFiles(files) {
   if (!files || files.length === 0) return;
 
+  // 重置状态
   batchCommands = [];
-  let fileNames = [];
-  let pending = files.length;
+  stopBatchSend();          // 停止正在运行的批量发送
+  csvLoadCancelled = false; // 在 stopBatchSend 之后重置，因为它会将其设为 true
 
-  Array.from(files).forEach(file => {
+  // 显示加载进度条
+  document.getElementById('batchProgress').style.display = 'block';
+  document.getElementById('batchControls').style.display = 'none';
+  document.getElementById('batchInfo').style.display = 'none';
+  document.getElementById('genResult').style.display = 'none';
+  document.getElementById('btnBatchStart').disabled = true;
+
+  const fileNames = [];
+  let allCommands = [];
+  let truncated = false;
+
+  // 逐个文件串行加载，进度汇总
+  const fileList = Array.from(files);
+  let fileIdx = 0;
+
+  function loadNextFile() {
+    if (csvLoadCancelled || fileIdx >= fileList.length) {
+      onAllFilesLoaded();
+      return;
+    }
+
+    const file = fileList[fileIdx];
+    document.getElementById('batchText').textContent =
+      `正在解析: ${file.name} (${fileIdx + 1}/${fileList.length})...`;
+
     const reader = new FileReader();
     reader.onload = (e) => {
-      const cmds = parseCSVContent(e.target.result);
-      if (cmds.length > 0) {
-        batchCommands = batchCommands.concat(cmds);
-        fileNames.push(file.name);
-      } else {
-        addLog('error', `${file.name}: 未找到有效指令`);
-      }
-      pending--;
-      if (pending === 0) {
-        if (batchCommands.length === 0) {
-          addLog('error', '所有文件均未找到有效指令');
-          return;
+      parseCSVChunked(e.target.result,
+        (cmds, totalLines, isTruncated) => {
+          if (cmds.length > 0) {
+            fileNames.push(file.name);
+            allCommands = allCommands.concat(cmds);
+          }
+          if (isTruncated) truncated = true;
+          fileIdx++;
+          loadNextFile();
+        },
+        (pct, loaded) => {
+          document.getElementById('batchFill').style.width = Math.min(pct, 100) + '%';
+          document.getElementById('batchText').textContent =
+            `解析 ${file.name}: ${pct}% (已加载 ${loaded.toLocaleString()} 条)`;
         }
-        document.getElementById('batchInfo').style.display = 'flex';
-        document.getElementById('batchFileName').textContent =
-          `文件: ${fileNames.length}个 (${fileNames.slice(0,3).join(', ')}${fileNames.length>3?'...':''})`;
-        document.getElementById('batchTotal').textContent = `共 ${batchCommands.length} 条指令`;
-        document.getElementById('batchControls').style.display = 'flex';
-        document.getElementById('batchProgress').style.display = 'none';
-        document.getElementById('genResult').style.display = 'none';
-        generatedCommands = batchCommands;
-        addLog('tx', `已加载 ${fileNames.length} 个文件，共 ${batchCommands.length} 条指令`);
-      }
+      );
     };
     reader.onerror = () => {
       addLog('error', `读取 ${file.name} 失败`);
-      pending--;
+      fileIdx++;
+      loadNextFile();
     };
     reader.readAsText(file);
-  });
+  }
+
+  function onAllFilesLoaded() {
+    document.getElementById('batchProgress').style.display = 'none';
+    document.getElementById('batchFill').style.width = '0%';
+
+    if (allCommands.length === 0) {
+      addLog('error', '所有文件均未找到有效指令');
+      return;
+    }
+
+    batchCommands = allCommands;
+    generatedCommands = batchCommands;
+
+    document.getElementById('batchInfo').style.display = 'flex';
+    document.getElementById('batchFileName').textContent =
+      `文件: ${fileNames.length}个 (${fileNames.slice(0,3).join(', ')}${fileNames.length>3?'...':''})`;
+    const capInfo = truncated ? ` (已达上限 ${MAX_BATCH_LOAD.toLocaleString()} 条，超出部分已截断)` : '';
+    document.getElementById('batchTotal').textContent =
+      `共 ${batchCommands.length.toLocaleString()} 条指令${capInfo}`;
+    document.getElementById('batchControls').style.display = 'flex';
+    document.getElementById('btnBatchStart').disabled = false;
+
+    if (truncated) {
+      addLog('tx', `⚠ 已加载 ${fileNames.length} 个文件，截取前 ${MAX_BATCH_LOAD.toLocaleString()} 条 (总量过大)`);
+    } else {
+      addLog('tx', `已加载 ${fileNames.length} 个文件，共 ${batchCommands.length.toLocaleString()} 条指令`);
+    }
+  }
+
+  loadNextFile();
 }
+
+// 全关指令 (所有通道关闭)，间隔期间周期发送以主动关断
+const ALL_OFF_CMD = [0x55, 0xAA, 0x00, 0x09, 0x00, 0x00, 0x00, 0x00, 0x08];
+const ALL_OFF_HEX = formatHex(ALL_OFF_CMD);
 
 function startBatchSend() {
   if (!isConnected) { addLog('error', '请先连接串口'); return; }
@@ -750,7 +844,8 @@ function sendHoldCycle() {
   if (batchIndex >= batchCommands.length) { batchSendComplete(); return; }
 
   const cmd = batchCommands[batchIndex];
-  const repeatMs = parseInt(document.getElementById('batchRepeatMs').value) || 200;
+  const freqHz = parseInt(document.getElementById('batchFreqHz').value) || 5;
+  const repeatMs = Math.round(1000 / Math.max(1, Math.min(10, freqHz))); // 次/s → ms 间隔
   const holdSec = parseInt(document.getElementById('batchHoldSec').value) || 5;
   const gapSec = parseInt(document.getElementById('batchGapSec').value) || 2;
   const holdMs = holdSec * 1000;
@@ -768,22 +863,27 @@ function sendHoldCycle() {
 
     const elapsed = Date.now() - batchHoldStart;
     if (elapsed >= holdMs) {
-      // 保持结束 → 进入间隔
+      // 保持结束 → 进入间隔，主动发送全关指令关断电磁阀
       batchInGap = true;
-      updateBatchProgressHolding(batchIndex + 1, batchCommands.length, gapSec, 0);
       let gapRemaining = gapSec;
-      function gapCountdown() {
+      updateBatchProgressHolding(batchIndex + 1, batchCommands.length, gapRemaining, batchHoldCount);
+
+      function gapTick() {
         if (batchPaused) return;
         gapRemaining--;
         if (gapRemaining <= 0) {
           batchIndex++;
           sendHoldCycle();  // 下一组
-        } else {
-          updateBatchProgressHolding(batchIndex + 1, batchCommands.length, gapSec, gapSec - gapRemaining);
-          batchHoldTimer = setTimeout(gapCountdown, 1000);
+          return;
         }
+        // 间隔期间周期发送全关指令，确保设备真正关断
+        window.sbcAPI.sendData(ALL_OFF_CMD).catch(() => {});
+        updateBatchProgressHolding(batchIndex + 1, batchCommands.length, gapRemaining, batchHoldCount);
+        batchHoldTimer = setTimeout(gapTick, 1000);
       }
-      batchHoldTimer = setTimeout(gapCountdown, 1000);
+      // 进入间隔立即发一次全关
+      window.sbcAPI.sendData(ALL_OFF_CMD).catch(() => {});
+      batchHoldTimer = setTimeout(gapTick, 1000);
       return;
     }
 
@@ -841,6 +941,7 @@ function pauseBatchSend() {
 }
 
 function stopBatchSend() {
+  csvLoadCancelled = true;  // 同时取消正在进行的 CSV 加载
   batchPaused = false;
   if (batchHoldTimer) { clearTimeout(batchHoldTimer); batchHoldTimer = null; }
   batchIndex = batchCommands.length;

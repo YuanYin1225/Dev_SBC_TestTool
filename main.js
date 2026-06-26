@@ -133,25 +133,35 @@ function openSerialPort(portPath) {
           rawTimer = setTimeout(() => {
             rawTimer = null;
             if (rawBuffer.length > 0) {
-              let crcOk = false;
-              let text = '';
-              // 最后 1 字节 = CRC，前面是文本载荷
-              if (rawBuffer.length >= 3) {
-                const payload = rawBuffer.slice(0, -1);
-                const crcByte = rawBuffer[rawBuffer.length - 1];
-                const sum = payload.reduce((s, b) => s + b, 0);
-                crcOk = (sum & 0xFF) === crcByte;
-                text = payload.toString('utf8').replace(/[^\x20-\x7E]/g, '').trim();
-              }
-              if (!text) {
-                text = rawBuffer.toString('utf8').replace(/[^\x20-\x7E\r\n]/g, '').trim();
-              }
-              if (text.length > 0 && mainWindow && !mainWindow.isDestroyed()) {
-                mainWindow.webContents.send('serial-data', {
-                  hex: Array.from(rawBuffer).map(b => b.toString(16).padStart(2, '0').toUpperCase()).join(' '),
-                  parsed: { type: 'text', text: text, crcOk: crcOk },
-                  raw: Array.from(rawBuffer)
-                });
+              // 过滤回显命令：55 AA 开头的是发送指令的回显，不是文本响应
+              const isEcho = (rawBuffer[0] === 0x55 && rawBuffer[1] === 0xAA);
+              if (!isEcho) {
+                let crcOk = false;
+                let text = '';
+                let source = 'unknown';
+                // 最后 1 字节 = CRC，前面是文本载荷
+                if (rawBuffer.length >= 3) {
+                  const payload = rawBuffer.slice(0, -1);
+                  const crcByte = rawBuffer[rawBuffer.length - 1];
+                  const sum = payload.reduce((s, b) => s + b, 0);
+                  crcOk = (sum & 0xFF) === crcByte;
+                  text = payload.toString('utf8').replace(/[^\x20-\x7E]/g, '').trim();
+                  // 判断是否为固件版本响应：CRC正确且文本较长
+                  if (crcOk && text.length >= 2) {
+                    source = 'firmware';
+                  }
+                }
+                if (!text) {
+                  text = rawBuffer.toString('utf8').replace(/[^\x20-\x7E\r\n]/g, '').trim();
+                  if (text.length >= 2) source = 'firmware';
+                }
+                if (text.length > 0 && mainWindow && !mainWindow.isDestroyed()) {
+                  mainWindow.webContents.send('serial-data', {
+                    hex: Array.from(rawBuffer).map(b => b.toString(16).padStart(2, '0').toUpperCase()).join(' '),
+                    parsed: { type: 'text', text: text, crcOk: crcOk, source: source },
+                    raw: Array.from(rawBuffer)
+                  });
+                }
               }
               rawBuffer = Buffer.alloc(0);
             }
