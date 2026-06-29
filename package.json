@@ -7,7 +7,7 @@
   "license": "MIT",
   "scripts": {
     "start": "electron .",
-    "build:win": "electron-builder --win portable",
+    "build:win": "set CSC_IDENTITY_AUTO_DISCOVERY=false&& set ELECTRON_BUILDER_BINARIES_MIRROR=https://registry.npmmirror.com/-/binary/electron-builder-binaries/&& electron-builder --win portable",
     "postinstall": "electron-builder install-app-deps"
   },
   "dependencies": {
@@ -28,7 +28,9 @@
     ],
     "win": {
       "target": "portable",
-      "icon": "build/icon.ico"
+      "sign": false,
+      "signDlls": false,
+      "signAndEditExecutable": false
     }
   }
 }
