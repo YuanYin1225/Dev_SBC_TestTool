@@ -96,6 +96,11 @@
           <button class="btn-action" data-action="queryLED">故障灯查询</button>
           <span id="ledStatus" class="info-tag">--</span>
         </div>
+        <!-- 故障码查询 -->
+        <div class="action-row">
+          <button class="btn-action btn-fault-query" id="btnFaultQuery">🔍 故障码查询</button>
+          <span id="faultQueryHint" class="info-tag">点击查询设备故障码</span>
+        </div>
         <div class="action-grid">
           <button class="btn-action btn-danger-action" data-action="bootloader">设备复位/升级</button>
         </div>
@@ -170,6 +175,64 @@
       </div>
       <div id="logArea">
         <div class="log-empty">等待串口数据...</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== Fault Code Query Modal ===== -->
+  <div id="faultModal" class="modal-overlay" style="display:none">
+    <div class="modal-container">
+      <div class="modal-header">
+        <span class="modal-title">🔍 故障码查询</span>
+        <button id="btnCloseFaultModal" class="btn-modal-close" title="关闭">✕</button>
+      </div>
+      <div class="modal-body">
+        <!-- 故障状态概览 -->
+        <div class="fault-section">
+          <div class="fault-section-title">故障状态概览</div>
+          <div class="fault-summary" id="faultSummary">
+            <span class="fault-status-badge" id="faultStatusBadge">等待查询...</span>
+          </div>
+          <div class="fault-bitmap-table" id="faultBitmapTable"></div>
+        </div>
+        <!-- 通道故障详情 -->
+        <div class="fault-section">
+          <div class="fault-section-title">通道故障记录 (fault_ch)</div>
+          <div class="fault-ch-info" id="faultChInfo">
+            <span class="text-muted">等待查询...</span>
+          </div>
+          <div class="fault-ch-grid" id="faultChGrid"></div>
+        </div>
+        <!-- 保护状态 -->
+        <div class="fault-section">
+          <div class="fault-section-title">实时测量数据</div>
+          <div class="fault-measure-grid">
+            <div class="fault-measure-item">
+              <div class="fm-label">保护状态 protectStatus</div>
+              <div class="fm-value" id="fmProtectStatus">--</div>
+              <div class="fm-unit"></div>
+            </div>
+            <div class="fault-measure-item">
+              <div class="fm-label">12V总线电流 I_DCF</div>
+              <div class="fm-value" id="fmIDCF">--</div>
+              <div class="fm-unit">mA</div>
+            </div>
+            <div class="fault-measure-item">
+              <div class="fm-label">12V电压 V_12VT</div>
+              <div class="fm-value" id="fmV12VT">--</div>
+              <div class="fm-unit">V</div>
+            </div>
+          </div>
+        </div>
+        <!-- 原始数据 -->
+        <div class="fault-section">
+          <div class="fault-section-title">原始响应数据</div>
+          <div class="fault-raw" id="faultRawData">--</div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button id="btnRefreshFault" class="btn-sm btn-primary" style="width:auto">🔄 刷新查询</button>
+        <button id="btnCloseFaultModal2" class="btn-sm" style="width:auto">关闭</button>
       </div>
     </div>
   </div>

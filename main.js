@@ -280,10 +280,28 @@ function parseResponseFrame(frame) {
     } else {
       return { type: 'shortResponse', crcOk, raw: Array.from(frame.slice(4, frame.length - 1)) };
     }
+  } else if (dataLen === 0x0E && frame.length >= 14 && frame[4] === 0x81) {
+    // Fault code query response: 55 BB 00 0E 81 [faultBitmap] [fault_ch:4] [protectStatus] [I_DCF] [V_12VT] [CRC]
+    const faultBitmap = frame[5];
+    const faultCh = (frame[6] << 24) | (frame[7] << 16) | (frame[8] << 8) | frame[9];
+    const protectStatus = frame[10];
+    const I_DCF = frame[11];
+    const V_12VT = frame[12];
+    return {
+      type: 'queryFault',
+      crcOk,
+      data: {
+        faultBitmap: faultBitmap,
+        faultCh: faultCh,
+        protectStatus: protectStatus,
+        I_DCF: I_DCF,
+        V_12VT: V_12VT
+      }
+    };
   } else if (dataLen === 0x0F && frame.length >= 15) {
     // Real-time data response (15 bytes total)
     // 55 BB 00 0F [ch3] [ch2] [ch1] [ch0] [I_MCU] [I_DCF] [V_12VT] [V_DCF] [V_VCC] [T0] [CRC]
-    // 电压 ×0.1V, 电流 ×10mA, T0 ×10ms
+    // 电压 ×0.1V, 电流 mA（设备端已是mA单位）, T0 ×10ms
     const chStat = ((frame[4] & 0x0F) << 24) | (frame[5] << 16) | (frame[6] << 8) | frame[7];
     return {
       type: 'queryRT',

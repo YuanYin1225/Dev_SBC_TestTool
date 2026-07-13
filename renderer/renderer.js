@@ -271,13 +271,194 @@ async function queryRealTime() {
 
 async function queryFault() {
   if (!isConnected) return;
-  const cmd = buildQueryCommand(0x81);
+  const cmd = buildQueryCommand(0x81, 0x00);
   try {
     await window.sbcAPI.sendData(cmd);
     addLog('tx', formatHex(cmd), '故障查询');
   } catch (e) {
     addLog('error', '查询失败: ' + e.message);
   }
+}
+
+// ========== Fault Code Query Modal ==========
+const FAULT_BITMAP_DEFS = [
+  { bit: 0, name: 'TPS259 短路', desc: 'TPS259电子保险丝检测到短路' },
+  { bit: 1, name: 'KZ端口/12V 短路', desc: 'KZ端口或12V电源对地短路' },
+  { bit: 2, name: '电流过载', desc: '电磁阀驱动电流超过阈值' },
+  { bit: 3, name: '电压异常', desc: '12V系统电压超出正常范围' },
+  { bit: 4, name: '当前保护中', desc: '设备正处于保护状态' },
+];
+
+function openFaultModal() {
+  document.getElementById('faultModal').style.display = 'flex';
+  resetFaultModal();
+  // Auto-query on open
+  if (isConnected) {
+    queryFaultCode();
+  }
+}
+
+function closeFaultModal() {
+  document.getElementById('faultModal').style.display = 'none';
+}
+
+function resetFaultModal() {
+  document.getElementById('faultStatusBadge').textContent = '查询中...';
+  document.getElementById('faultStatusBadge').className = 'fault-status-badge querying';
+  document.getElementById('faultBitmapTable').innerHTML = '';
+  document.getElementById('faultChInfo').innerHTML = '<span class="text-muted">查询中...</span>';
+  document.getElementById('faultChGrid').innerHTML = '';
+  document.getElementById('fmProtectStatus').textContent = '--';
+  document.getElementById('fmIDCF').textContent = '--';
+  document.getElementById('fmV12VT').textContent = '--';
+  document.getElementById('faultRawData').textContent = '--';
+}
+
+async function queryFaultCode() {
+  if (!isConnected) {
+    updateFaultModalStatus('not-connected', '未连接设备');
+    return;
+  }
+  const cmd = buildQueryCommand(0x81, 0x00);
+  try {
+    await window.sbcAPI.sendData(cmd);
+    addLog('tx', formatHex(cmd), '故障码查询');
+    document.getElementById('faultStatusBadge').textContent = '已发送查询，等待响应...';
+    document.getElementById('faultStatusBadge').className = 'fault-status-badge querying';
+  } catch (e) {
+    addLog('error', '故障码查询失败: ' + e.message);
+    updateFaultModalStatus('error', '发送失败');
+  }
+}
+
+function updateFaultModalStatus(status, text) {
+  const badge = document.getElementById('faultStatusBadge');
+  badge.textContent = text;
+  badge.className = 'fault-status-badge ' + status;
+}
+
+function handleFaultQueryData(data) {
+  const { faultBitmap, faultCh, protectStatus, I_DCF, V_12VT } = data;
+
+  // 1. Fault bitmap parsing
+  renderFaultBitmap(faultBitmap);
+
+  // 2. Overall status
+  if (faultBitmap === 0) {
+    updateFaultModalStatus('normal', '✅ 设备正常，无故障');
+  } else {
+    const faultCount = countBits(faultBitmap);
+    updateFaultModalStatus('fault', `⚠ 检测到 ${faultCount} 类故障`);
+  }
+
+  // 3. Channel fault records (fault_ch)
+  renderFaultChGrid(faultCh);
+
+  // 4. Protection status
+  document.getElementById('fmProtectStatus').textContent =
+    '0x' + protectStatus.toString(16).padStart(2, '0').toUpperCase() +
+    (protectStatus === 0 ? ' (正常)' : ' (有保护动作)');
+
+  // 5. Measurements
+  document.getElementById('fmIDCF').textContent = I_DCF + ' mA';
+  if (I_DCF > 0) {
+    document.getElementById('fmIDCF').style.color = '#e3b341';
+  } else {
+    document.getElementById('fmIDCF').style.color = '#58a6ff';
+  }
+
+  const v12 = (V_12VT * 0.1).toFixed(1);
+  document.getElementById('fmV12VT').textContent = v12 + ' V';
+  if (V_12VT * 0.1 < 9.0 || V_12VT * 0.1 > 16.0) {
+    document.getElementById('fmV12VT').style.color = '#f85149';
+  } else {
+    document.getElementById('fmV12VT').style.color = '#58a6ff';
+  }
+}
+
+function renderFaultBitmap(faultBitmap) {
+  let html = '<table class="fault-detail-table"><thead><tr>'
+    + '<th>位</th><th>故障名称</th><th>状态</th><th>说明</th>'
+    + '</tr></thead><tbody>';
+
+  FAULT_BITMAP_DEFS.forEach(def => {
+    const bitVal = (faultBitmap >> def.bit) & 1;
+    const statusCls = bitVal ? 'fault-bit-fault' : 'fault-bit-ok';
+    const statusText = bitVal ? '⚠ 故障' : '✓ 正常';
+    html += `<tr class="${statusCls}">`
+      + `<td>bit ${def.bit}</td>`
+      + `<td>${def.name}</td>`
+      + `<td class="fault-status-cell">${statusText}</td>`
+      + `<td>${def.desc}</td>`
+      + '</tr>';
+  });
+
+  html += '</tbody></table>';
+  document.getElementById('faultBitmapTable').innerHTML = html;
+}
+
+function renderFaultChGrid(faultCh) {
+  // Build channel info: each bit in faultCh corresponds to a channel
+  // faultCh bit positions match the channel bits from CHANNEL_MAP
+  const faultChHex = '0x' + (faultCh >>> 0).toString(16).padStart(8, '0').toUpperCase();
+  const faultChBin = (faultCh >>> 0).toString(2).padStart(32, '0');
+
+  // Count faulty channels
+  let faultCount = 0;
+  for (let i = 0; i < 32; i++) {
+    if ((faultCh >>> i) & 1) faultCount++;
+  }
+
+  let infoHtml = '';
+  if (faultCount === 0) {
+    infoHtml = '<span style="color:#3fb950">✅ 所有通道无故障记录</span>';
+  } else {
+    infoHtml = `<span style="color:#f85149">⚠ ${faultCount} 个通道有故障记录</span>`
+      + `<span style="color:#8b949e;margin-left:12px"> (Flash累积记录，故障恢复后自动清零)</span>`;
+  }
+  infoHtml += `<div style="margin-top:4px;font-family:monospace;font-size:11px;color:#8b949e">`
+    + `十六进制: ${faultChHex} &nbsp;|&nbsp; 二进制: ${faultChBin}</div>`;
+  document.getElementById('faultChInfo').innerHTML = infoHtml;
+
+  // Build channel grid showing fault status
+  // Map CHANNEL_MAP entries to their fault status
+  let gridHtml = '<div class="fault-ch-wrapper">';
+
+  const groups = {};
+  CHANNEL_MAP.forEach(ch => {
+    if (!groups[ch.j]) groups[ch.j] = [];
+    groups[ch.j].push(ch);
+  });
+
+  Object.keys(groups).sort((a, b) => a - b).forEach(j => {
+    const group = groups[j];
+    gridHtml += `<div class="fault-ch-group">`;
+    gridHtml += `<div class="fault-ch-group-label">J${j}</div>`;
+
+    group.forEach(ch => {
+      const isFault = (faultCh >>> ch.bit) & 1;
+      const cls = isFault ? 'fault-ch-cell-fault' : 'fault-ch-cell-ok';
+      const text = isFault ? '⚠' : '✓';
+      gridHtml += `<div class="fault-ch-cell ${cls}" title="J${ch.j}-${ch.k} (bit${ch.bit}): ${isFault ? '有故障记录' : '正常'}">`
+        + `<span class="fault-ch-name">J${ch.j}-${ch.k}</span>`
+        + `<span class="fault-ch-status">${text}</span>`
+        + '</div>';
+    });
+
+    gridHtml += '</div>';
+  });
+
+  gridHtml += '</div>';
+  document.getElementById('faultChGrid').innerHTML = gridHtml;
+}
+
+function countBits(n) {
+  let count = 0;
+  while (n) {
+    count += n & 1;
+    n >>>= 1;
+  }
+  return count;
 }
 
 function startAutoQuery() {
@@ -347,12 +528,12 @@ function handleSerialData(data) {
   let detail = '';
   if (parsed.type === 'queryRT' && parsed.data) {
     const d = parsed.data;
-    // 电压 ×0.1V，电流 ×10mA
+    // 电压 ×0.1V，电流 mA（设备端已是mA单位，无需换算）
     const v12 = (d.V_12VT * 0.1).toFixed(1);
     const vdcf = (d.V_DCF * 0.1).toFixed(1);
     const vvcc = (d.V_VCC * 0.1).toFixed(1);
-    const idcf = d.I_DCF * 10;
-    const imcu = d.I_MCU * 10;
+    const idcf = d.I_DCF;
+    const imcu = d.I_MCU;
     detail = `V12=${v12}V V_DCF=${vdcf}V V_VCC=${vvcc}V I_DCF=${idcf}mA I_MCU=${imcu}mA`;
 
     // Update real-time display
@@ -377,6 +558,27 @@ function handleSerialData(data) {
     const status = parsed.data.blinkFlag ? '已开启' : '已关闭';
     document.getElementById('ledStatus').textContent = status;
     detail = `故障灯状态: ${status}`;
+  } else if (parsed.type === 'queryFault' && parsed.data) {
+    // Fault code query response
+    const d = parsed.data;
+    const v12 = (d.V_12VT * 0.1).toFixed(1);
+    detail = `故障查询: faultBitmap=0x${d.faultBitmap.toString(16).padStart(2,'0').toUpperCase()}`
+      + ` fault_ch=0x${(d.faultCh>>>0).toString(16).padStart(8,'0').toUpperCase()}`
+      + ` protectStatus=0x${d.protectStatus.toString(16).padStart(2,'0').toUpperCase()}`
+      + ` I_DCF=${d.I_DCF}mA V_12VT=${v12}V`;
+    // Update fault modal if it's open
+    if (document.getElementById('faultModal').style.display === 'flex') {
+      handleFaultQueryData(d);
+    }
+    // Update hint
+    const hasFault = d.faultBitmap !== 0 || d.faultCh !== 0;
+    const hintEl = document.getElementById('faultQueryHint');
+    if (hintEl) {
+      hintEl.textContent = hasFault ? '⚠ 设备存在故障!' : '✓ 设备正常';
+      hintEl.style.color = hasFault ? '#f85149' : '#3fb950';
+    }
+    // Update raw data field
+    document.getElementById('faultRawData').textContent = hex;
   } else if (parsed.type === 'text' && parsed.text) {
     const crcInfo = parsed.crcOk ? ' ✓' : ' ⚠CRC';
     const isFW = (parsed.source === 'firmware');
@@ -994,6 +1196,27 @@ function init() {
   // Quick actions
   document.querySelectorAll('.btn-action').forEach(btn => {
     btn.addEventListener('click', () => quickAction(btn.dataset.action));
+  });
+
+  // Fault code query modal
+  document.getElementById('btnFaultQuery').addEventListener('click', openFaultModal);
+  document.getElementById('btnCloseFaultModal').addEventListener('click', closeFaultModal);
+  document.getElementById('btnCloseFaultModal2').addEventListener('click', closeFaultModal);
+  document.getElementById('btnRefreshFault').addEventListener('click', () => {
+    resetFaultModal();
+    queryFaultCode();
+  });
+  // Close modal on overlay click
+  document.getElementById('faultModal').addEventListener('click', (e) => {
+    if (e.target === document.getElementById('faultModal')) {
+      closeFaultModal();
+    }
+  });
+  // ESC key to close modal
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && document.getElementById('faultModal').style.display === 'flex') {
+      closeFaultModal();
+    }
   });
 
   // Manual command
