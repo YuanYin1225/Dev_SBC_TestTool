@@ -200,3 +200,53 @@ input { width:100%; }
 ::-webkit-scrollbar-track { background:#1a1d23; }
 ::-webkit-scrollbar-thumb { background:#30363d; border-radius:3px; }
 ::-webkit-scrollbar-thumb:hover { background:#444c56; }
+
+/* ===== Ymodem Upgrade Modal ===== */
+.ymodem-modal-container { width: 550px; max-width: 95vw; }
+.ymodem-step { display: flex; flex-direction: column; gap: 12px; }
+.ymodem-step-title {
+  font-size: 14px; font-weight: bold; color: #f0f6fc;
+  padding-bottom: 8px; border-bottom: 1px solid #30363d;
+}
+.ymodem-file-area {
+  display: flex; flex-direction: column; align-items: center;
+  gap: 12px; padding: 20px 0;
+}
+.ymodem-file-info {
+  display: flex; align-items: center; gap: 8px;
+  background: #1a1d23; border: 1px solid #30363d;
+  border-radius: 6px; padding: 10px 16px;
+}
+.ymodem-file-icon { font-size: 20px; }
+.ymodem-file-size { color: #8b949e; font-size: 12px; margin-left: 4px; }
+.ymodem-status-row { display: flex; justify-content: center; margin-bottom: 4px; }
+.ymodem-status-badge {
+  padding: 6px 18px; border-radius: 6px; font-size: 13px; font-weight: bold;
+}
+.ymodem-status-badge.transferring {
+  background: #1a3a5c; color: #58a6ff; border: 1px solid #1f6feb;
+}
+.ymodem-status-badge.success {
+  background: #0d3320; color: #3fb950; border: 1px solid #238636;
+}
+.ymodem-status-badge.error {
+  background: #5c1a1a; color: #f85149; border: 1px solid #b62324;
+}
+.ymodem-progress-bar { margin: 12px 0 4px; }
+.ymodem-log-area {
+  font-family: "Cascadia Code", "Consolas", monospace; font-size: 11px;
+  background: #1a1d23; border: 1px solid #30363d;
+  border-radius: 6px; padding: 10px 12px; max-height: 180px; overflow-y: auto;
+}
+.ymodem-log-line { padding: 2px 0; display:flex; gap:8px; }
+.ymodem-log-line .ymodem-log-time { color: #484f58; flex-shrink:0; }
+.ymodem-log-line.info { color: #58a6ff; }
+.ymodem-log-line.success { color: #3fb950; }
+.ymodem-log-line.error { color: #f85149; }
+.ymodem-log-line.warning { color: #e3b341; }
+.ymodem-result { display:flex; flex-direction:column; align-items:center; gap:12px; padding:20px 0; }
+.ymodem-result-icon { font-size: 48px; }
+.ymodem-result-title { font-size: 18px; font-weight: bold; }
+.ymodem-result-title.success { color: #3fb950; }
+.ymodem-result-title.error { color: #f85149; }
+.ymodem-result-detail { font-size: 13px; color: #8b949e; }

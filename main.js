@@ -1,13 +1,19 @@
-const { app, BrowserWindow, ipcMain, shell } = require('electron');
+const { app, BrowserWindow, ipcMain, shell, dialog } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const { SerialPort } = require('serialport');
+const { YmodemSender, MODEM_C, ACK, NAK, CA } = require('./ymodem');
 
 let mainWindow = null;
 let serialPort = null;
 let tempFilePath = null;      // 当前临时文件路径
 let tempFileStream = null;    // 写入流
+
+// Ymodem firmware upgrade state
+let isYmodemMode = false;     // 为 true 时绕过 55 BB 帧解析器
+let ymodemAbortFlag = false;  // 取消传输标志
+let ymodemHandler = null;     // Ymodem 接收数据处理回调
 
 // ========== Window ==========
 function createWindow() {
@@ -16,7 +22,7 @@ function createWindow() {
     height: 860,
     minWidth: 1100,
     minHeight: 700,
-    title: 'SBC电磁阀驱动器测试工具 V3.2',
+    title: 'SBC电磁阀驱动器测试工具 V3.3',
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -57,16 +63,21 @@ async function listSerialPorts() {
   }
 }
 
-function openSerialPort(portPath) {
+function openSerialPort(portPath, options = {}) {
+  const baudRate = options.baudRate || 9600;
+  const ymodemMode = options.isYmodem || false;
+
   return new Promise((resolve, reject) => {
     try {
       serialPort = new SerialPort({
         path: portPath,
-        baudRate: 9600,
+        baudRate: baudRate,
         dataBits: 8,
         parity: 'none',
         stopBits: 1,
-        autoOpen: false
+        autoOpen: false,
+        dtr: false,
+        rts: false
       });
 
       // Raw data buffer for binary protocol
@@ -75,6 +86,12 @@ function openSerialPort(portPath) {
       const RAW_TIMEOUT = 200;   // 200ms 内无新数据则视为完整帧
 
       serialPort.on('data', (data) => {
+        // Ymodem 模式下不进行 55 BB 帧解析，数据直接交给 ymodemHandler
+        if (ymodemMode && ymodemHandler) {
+          ymodemHandler(data);
+          return;
+        }
+
         // 每次收到数据重置超时
         if (rawTimer) clearTimeout(rawTimer);
 
@@ -170,12 +187,14 @@ function openSerialPort(portPath) {
       });
 
       serialPort.on('error', (err) => {
+        if (isYmodemMode) return;  // Ymodem mode handles errors separately
         if (mainWindow && !mainWindow.isDestroyed()) {
           mainWindow.webContents.send('serial-error', err.message);
         }
       });
 
       serialPort.on('close', () => {
+        if (isYmodemMode) return;  // suppress event during Ymodem baud-rate switch
         if (mainWindow && !mainWindow.isDestroyed()) {
           mainWindow.webContents.send('serial-closed');
         }
@@ -219,6 +238,352 @@ function sendSerialData(byteArray) {
     });
   });
 }
+
+// ========== Ymodem Firmware Upgrade ==========
+
+/**
+ * Send a data buffer to the serial port and wait for drain.
+ */
+function ymodemWrite(buffer) {
+  return new Promise((resolve, reject) => {
+    if (!serialPort || !serialPort.isOpen) {
+      reject(new Error('串口未打开'));
+      return;
+    }
+    serialPort.write(buffer, (err) => {
+      if (err) reject(err);
+      else serialPort.drain((err2) => {
+        if (err2) reject(err2);
+        else resolve();
+      });
+    });
+  });
+}
+
+/**
+ * Execute the Ymodem firmware upgrade transfer.
+ *
+ * Flow:
+ * 1. Read firmware .bin file into memory
+ * 2. Send bootloader entry command (0x2B x 7) at current baud rate
+ * 3. Wait 300ms for device to reset
+ * 4. Switch serial port to 115200 in Ymodem mode
+ * 5. Wait for 'C' from bootloader
+ * 6. Send Packet #0 (file info), wait for ACK + 'C'
+ * 7. Send data packets, wait for 'C' after each
+ * 8. On completion: reopen port at 9600 in normal mode
+ *
+ * @param {string} portPath - serial port path (e.g. "COM3")
+ * @param {string} filePath - path to .bin firmware file
+ * @returns {Promise<{success: boolean, error?: string}>}
+ */
+async function executeYmodemTransfer(portPath, filePath) {
+  isYmodemMode = true;
+  ymodemAbortFlag = false;
+
+  let fileBuffer;
+  let fileName;
+  let sender;
+
+  try {
+    // --- Step 1: Read firmware file ---
+    sendYmodemLog('读取固件文件...', 'info');
+    fileBuffer = fs.readFileSync(filePath);
+    fileName = path.basename(filePath);
+    sender = new YmodemSender(fileBuffer, fileName);
+    sendYmodemLog(`固件: ${fileName} (${(fileBuffer.length / 1024).toFixed(1)} KB)`, 'info');
+
+    // --- Step 2: Send bootloader entry command ---
+    sendYmodemLog('发送 Bootloader 进入命令 (0x2B x 7)...', 'info');
+    const bootloaderCmd = [0x2B, 0x2B, 0x2B, 0x2B, 0x2B, 0x2B, 0x2B];
+    await sendSerialData(bootloaderCmd);
+    sendYmodemLog('等待设备复位进入 Bootloader...', 'info');
+
+    // --- Step 3: Wait for device to reset into bootloader ---
+    await sleep(400);
+
+    // --- Step 4: Close port and reopen at 115200 in Ymodem mode ---
+    sendYmodemLog('切换波特率至 115200...', 'info');
+    if (serialPort && serialPort.isOpen) {
+      serialPort.close();
+    }
+    serialPort = null;
+    await sleep(200);
+
+    await openSerialPort(portPath, { baudRate: 115200, isYmodem: true });
+    sendYmodemLog('串口已切换至 115200 (8N1)，等待 Bootloader 响应...', 'info');
+
+    // --- Step 5: Set up Ymodem data collector ---
+    const { dataQueue, dataResolve, readNextByte, readUntilByte, readBytesUntil } = createDataCollector();
+
+    ymodemHandler = (data) => {
+      for (let i = 0; i < data.length; i++) {
+        if (dataResolve.current) {
+          dataResolve.current(data[i]);
+          dataResolve.current = null;
+        } else {
+          dataQueue.push(data[i]);
+        }
+      }
+    };
+
+    // --- Step 6: Wait for 'C' (0x43) from bootloader ---
+    sendYmodemLog('等待 Bootloader 发送 C (0x43)...', 'info');
+    try {
+      await readUntilByte(MODEM_C, 15000);  // 15-second timeout
+    } catch (e) {
+      sendYmodemLog('错误: 未收到 Bootloader 响应，请确认设备已进入升级模式', 'error');
+      throw new Error('未收到 Bootloader 响应 (超时等待 C)');
+    }
+    sendYmodemLog('收到 Bootloader 握手信号 (C)，开始传输...', 'success');
+
+    // --- Step 7: Send Packet #0 (file info) ---
+    const packet0 = sender.buildPacket0();
+    sendYmodemLog(`发送 Packet #0: 文件信息 (${fileName}, ${fileBuffer.length} bytes)`, 'info');
+    await ymodemWrite(packet0);
+
+    // Wait for ACK (0x06) then 'C' (0x43) from device
+    sendYmodemLog('等待 ACK + C...', 'info');
+    try {
+      let gotAck = false;
+      let gotC = false;
+      const startTime = Date.now();
+      const timeout = 10000;
+
+      while (!gotAck || !gotC) {
+        if (Date.now() - startTime > timeout) {
+          throw new Error('超时等待 ACK/C');
+        }
+        if (ymodemAbortFlag) throw new Error('传输取消');
+
+        const byte = await readNextByte(3000);
+        if (byte === ACK && !gotAck) {
+          gotAck = true;
+          sendYmodemLog('收到 ACK (0x06)', 'success');
+        } else if (byte === MODEM_C && gotAck) {
+          gotC = true;
+          sendYmodemLog('收到 C (0x43)', 'success');
+        } else if (byte === NAK) {
+          sendYmodemLog('收到 NAK (0x15)，重发 Packet #0...', 'warning');
+          await ymodemWrite(packet0);
+          gotAck = false;
+          gotC = false;
+          startTime = Date.now(); // reset timer
+        } else if (byte === CA) {
+          throw new Error('设备请求取消传输 (CA)');
+        }
+      }
+    } catch (e) {
+      sendYmodemLog(`错误: ACK/C 等待失败 - ${e.message}`, 'error');
+      throw e;
+    }
+
+    // --- Step 8: Send data packets ---
+    sendYmodemLog('开始发送固件数据...', 'info');
+    const MAX_RETRIES = 3;
+
+    while (!sender.isComplete()) {
+      if (ymodemAbortFlag) {
+        sendYmodemLog('传输被用户取消', 'warning');
+        throw new Error('传输取消');
+      }
+
+      // Send the next data packet (with retry loop)
+      let packet = sender.nextDataPacket();
+      if (!packet) break;
+
+      await ymodemWrite(packet);
+
+      // Report progress
+      const progress = sender.getProgress();
+      sendYmodemProgress(progress);
+      sendYmodemLog(
+        `发送 Packet #${progress.packetsSent}/${progress.totalPackets - 1} ` +
+        `(${progress.percent}% — ${(progress.offset / 1024).toFixed(1)} KB)`,
+        'info'
+      );
+
+      // Skip waiting for response after the last packet
+      if (sender.isComplete()) {
+        sendYmodemLog('所有数据已发送，等待设备完成烧录...', 'success');
+        break;
+      }
+
+      // Wait for 'C' (0x43) response, with retry on NAK
+      let retryCount = 0;
+      let gotResponse = false;
+      while (!gotResponse && retryCount <= MAX_RETRIES) {
+        if (ymodemAbortFlag) throw new Error('传输取消');
+
+        try {
+          const byte = await readNextByte(5000);
+          if (byte === MODEM_C) {
+            gotResponse = true;
+          } else if (byte === NAK) {
+            retryCount++;
+            if (retryCount > MAX_RETRIES) {
+              throw new Error(`重试超过 ${MAX_RETRIES} 次`);
+            }
+            sendYmodemLog(`收到 NAK (0x15)，重发 (${retryCount}/${MAX_RETRIES})...`, 'warning');
+            await ymodemWrite(packet);
+          } else if (byte === CA) {
+            throw new Error('设备请求取消传输 (CA)');
+          } else {
+            sendYmodemLog(`收到意外字节: 0x${byte.toString(16).toUpperCase()}，忽略`, 'warning');
+          }
+        } catch (e) {
+          if (retryCount >= MAX_RETRIES) {
+            sendYmodemLog(`错误: 等待 C 超时/失败 - ${e.message}`, 'error');
+            throw new Error(`数据包响应超时: ${e.message}`);
+          }
+          retryCount++;
+          sendYmodemLog(`超时，重发 (${retryCount}/${MAX_RETRIES})...`, 'warning');
+          await ymodemWrite(packet);
+        }
+      }
+    }
+
+    // --- Step 9: Transfer complete ---
+    sendYmodemProgress({ offset: sender.fileSize, total: sender.fileSize, percent: 100,
+      packetsSent: sender.packetsSent, totalPackets: sender.totalPackets });
+    sendYmodemLog('固件传输完成!', 'success');
+    sendYmodemLog('设备正在烧录 Flash 并跳转到新固件...', 'info');
+
+    // Wait for device to finish flashing and jump to app
+    await sleep(2000);
+
+    // --- Step 10: Restore normal serial port at 9600 ---
+    sendYmodemLog('恢复串口至 9600 (正常模式)...', 'info');
+    ymodemHandler = null;
+    if (serialPort && serialPort.isOpen) {
+      serialPort.close();
+    }
+    serialPort = null;
+    await sleep(300);
+
+    isYmodemMode = false;
+    await openSerialPort(portPath, { baudRate: 9600, isYmodem: false });
+
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('ymodem-complete', {
+        fileName: fileName,
+        fileSize: fileBuffer.length
+      });
+    }
+
+    sendYmodemLog('串口已恢复，升级完成!', 'success');
+    return { success: true };
+
+  } catch (err) {
+    // --- Error recovery ---
+    sendYmodemLog(`升级失败: ${err.message}`, 'error');
+
+    // Clean up Ymodem mode
+    ymodemHandler = null;
+    if (serialPort && serialPort.isOpen) {
+      try { serialPort.close(); } catch (e) { /* ignore */ }
+    }
+    serialPort = null;
+    await sleep(300);
+
+    // Restore normal serial port
+    try {
+      isYmodemMode = false;
+      await openSerialPort(portPath, { baudRate: 9600, isYmodem: false });
+      sendYmodemLog('串口已恢复至 9600 (正常模式)', 'info');
+    } catch (e2) {
+      sendYmodemLog(`警告: 恢复串口失败 - ${e2.message}`, 'warning');
+    }
+
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('ymodem-error', {
+        error: err.message
+      });
+    }
+
+    return { success: false, error: err.message };
+  }
+}
+
+/**
+ * Create a buffered byte collector for half-duplex Ymodem communication.
+ * Provides Promise-based access to incoming serial bytes.
+ */
+function createDataCollector() {
+  const dataQueue = [];
+  const dataResolve = { current: null };
+
+  function readNextByte(timeoutMs = 3000) {
+    return new Promise((resolve, reject) => {
+      // Check queue first
+      if (dataQueue.length > 0) {
+        resolve(dataQueue.shift());
+        return;
+      }
+
+      const timer = setTimeout(() => {
+        dataResolve.current = null;
+        reject(new Error(`超时 (${timeoutMs}ms)`));
+      }, timeoutMs);
+
+      dataResolve.current = (byte) => {
+        clearTimeout(timer);
+        resolve(byte);
+      };
+    });
+  }
+
+  async function readUntilByte(targetByte, timeoutMs = 15000) {
+    const startTime = Date.now();
+    while (Date.now() - startTime < timeoutMs) {
+      const remaining = timeoutMs - (Date.now() - startTime);
+      const byte = await readNextByte(Math.max(100, remaining));
+      if (byte === targetByte) return;
+    }
+    throw new Error(`超时等待字节 0x${targetByte.toString(16).toUpperCase()} (${timeoutMs}ms)`);
+  }
+
+  async function readBytesUntil(targetByte, maxBytes, timeoutMs = 5000) {
+    const bytes = [];
+    const startTime = Date.now();
+    while (bytes.length < maxBytes && (Date.now() - startTime) < timeoutMs) {
+      const remaining = timeoutMs - (Date.now() - startTime);
+      const byte = await readNextByte(Math.max(100, remaining));
+      bytes.push(byte);
+      if (byte === targetByte) return bytes;
+    }
+    return bytes;
+  }
+
+  return { dataQueue, dataResolve, readNextByte, readUntilByte, readBytesUntil };
+}
+
+/**
+ * Sleep helper (ms).
+ */
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * Send Ymodem progress to renderer.
+ */
+function sendYmodemProgress(progress) {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('ymodem-progress', progress);
+  }
+}
+
+/**
+ * Send Ymodem log entry to renderer.
+ */
+function sendYmodemLog(message, type) {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('ymodem-log', { message, type, time: new Date().toLocaleTimeString('zh-CN', { hour12: false }) });
+  }
+}
+
+// ========== Frame Parser ==========
 
 /**
  * Parse SBC response frame
@@ -391,6 +756,50 @@ ipcMain.handle('get-port-status', async () => {
     isOpen: serialPort ? serialPort.isOpen : false,
     path: serialPort ? serialPort.path : null
   };
+});
+
+// ========== Ymodem Firmware Upgrade IPC ==========
+ipcMain.handle('select-firmware-file', async () => {
+  try {
+    const result = await dialog.showOpenDialog(mainWindow, {
+      title: '选择固件文件',
+      filters: [
+        { name: 'Binary Files', extensions: ['bin'] },
+        { name: 'All Files', extensions: ['*'] }
+      ],
+      properties: ['openFile']
+    });
+    if (result.canceled || result.filePaths.length === 0) {
+      return { success: false, canceled: true };
+    }
+    const filePath = result.filePaths[0];
+    const stat = fs.statSync(filePath);
+    return {
+      success: true,
+      filePath: filePath,
+      fileName: path.basename(filePath),
+      fileSize: stat.size
+    };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+});
+
+ipcMain.handle('start-ymodem', async (event, filePath) => {
+  try {
+    if (!serialPort || !serialPort.path) {
+      return { success: false, error: '串口未连接，请先连接串口' };
+    }
+    const portPath = serialPort.path;
+    return await executeYmodemTransfer(portPath, filePath);
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+});
+
+ipcMain.handle('cancel-ymodem', async () => {
+  ymodemAbortFlag = true;
+  return { success: true };
 });
 
 // ========== Temp File (stream large CSV to disk) ==========

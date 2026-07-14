@@ -23,6 +23,13 @@ let activeChannels = new Array(28).fill(false);
 let isConnected = false;
 let autoQueryTimer = null;
 
+// Ymodem firmware upgrade state
+let ymodemFilePath = null;
+let ymodemFileName = null;
+let ymodemFileSize = 0;
+let ymodemTransferring = false;
+let ymodemCompleted = false;
+
 // ========== CRC / Command Utils ==========
 function calcCRC(bytes) {
   return bytes.reduce((sum, b) => sum + b, 0) & 0xFF;
@@ -496,7 +503,9 @@ async function quickAction(actionName) {
 
   // 特殊确认
   if (actionName === 'bootloader') {
-    if (!confirm('此操作将使设备复位进入升级模式，是否继续？')) return;
+    // 打开 Ymodem 固件升级弹窗（升级流程中会自动发送 Bootloader 进入命令）
+    openYmodemModal();
+    return;
   }
   if (actionName === 'faultOff') {
     if (!confirm('关闭故障检测将使设备忽略电磁阀故障，确保安全后继续？')) return;
@@ -1163,6 +1172,189 @@ function batchSendComplete() {
   addLog('tx', `批量发送结束 (${batchCommands.length}组)`);
 }
 
+// ========== Ymodem Firmware Upgrade Modal ==========
+
+function formatBytes(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
+  return (bytes / 1048576).toFixed(2) + ' MB';
+}
+
+function openYmodemModal() {
+  // Reset state
+  ymodemFilePath = null;
+  ymodemFileName = null;
+  ymodemFileSize = 0;
+  ymodemTransferring = false;
+  ymodemCompleted = false;
+
+  // Show step 1, hide steps 2 & 3
+  document.getElementById('ymodemStepSelect').style.display = 'flex';
+  document.getElementById('ymodemStepTransfer').style.display = 'none';
+  document.getElementById('ymodemStepResult').style.display = 'none';
+
+  // Reset file info
+  document.getElementById('ymodemFileInfo').style.display = 'none';
+  document.getElementById('ymodemFileName').textContent = '';
+  document.getElementById('ymodemFileSize').textContent = '';
+
+  // Reset progress
+  document.getElementById('ymodemFill').style.width = '0%';
+  document.getElementById('ymodemProgressText').textContent = '0%';
+  document.getElementById('ymodemLogArea').innerHTML = '';
+
+  // Buttons
+  document.getElementById('btnYmodemStart').disabled = true;
+  document.getElementById('btnYmodemStart').style.display = '';
+  document.getElementById('btnYmodemCancel').style.display = 'none';
+
+  // Status info
+  if (isConnected) {
+    addLog('tx', '进入固件升级模式，将在升级时自动切换至 115200 波特率');
+  }
+
+  // Show modal
+  document.getElementById('ymodemModal').style.display = 'flex';
+}
+
+function closeYmodemModal() {
+  if (ymodemTransferring) {
+    window.sbcAPI.cancelYmodem();
+  }
+  document.getElementById('ymodemModal').style.display = 'none';
+}
+
+async function selectFirmwareFile() {
+  try {
+    const result = await window.sbcAPI.selectFirmwareFile();
+    if (!result || result.canceled || !result.success) {
+      return;
+    }
+    ymodemFilePath = result.filePath;
+    ymodemFileName = result.fileName;
+    ymodemFileSize = result.fileSize;
+
+    document.getElementById('ymodemFileName').textContent = ymodemFileName;
+    document.getElementById('ymodemFileSize').textContent = formatBytes(ymodemFileSize);
+    document.getElementById('ymodemFileInfo').style.display = 'flex';
+    document.getElementById('btnYmodemStart').disabled = false;
+
+    addLog('tx', `已选择固件: ${ymodemFileName} (${formatBytes(ymodemFileSize)})`);
+  } catch (e) {
+    addLog('error', '选择固件文件失败: ' + e.message);
+  }
+}
+
+async function startYmodem() {
+  if (!ymodemFilePath) {
+    addLog('error', '请先选择固件文件');
+    return;
+  }
+  if (!isConnected) {
+    addLog('error', '请先连接串口');
+    return;
+  }
+
+  ymodemTransferring = true;
+
+  // Switch to step 2
+  document.getElementById('ymodemStepSelect').style.display = 'none';
+  document.getElementById('ymodemStepTransfer').style.display = 'flex';
+  document.getElementById('ymodemStepResult').style.display = 'none';
+
+  // Reset progress display
+  document.getElementById('ymodemFill').style.width = '0%';
+  document.getElementById('ymodemFill').className = 'progress-fill';
+  document.getElementById('ymodemProgressText').textContent = '准备连接...';
+  document.getElementById('ymodemLogArea').innerHTML = '';
+  document.getElementById('ymodemStatusBadge').textContent = '传输中...';
+  document.getElementById('ymodemStatusBadge').className = 'ymodem-status-badge transferring';
+
+  // Adjust buttons
+  document.getElementById('btnYmodemStart').style.display = 'none';
+  document.getElementById('btnYmodemCancel').style.display = '';
+
+  addLog('tx', `开始 Ymodem 固件升级: ${ymodemFileName}`);
+
+  try {
+    // This is async but the result comes via IPC events
+    const result = await window.sbcAPI.startYmodem(ymodemFilePath);
+    // If the promise resolves before events fire (e.g., immediate error),
+    // the events will still handle the UI update.
+    if (!result || !result.success) {
+      // Error case: events may or may not fire; ensure UI reflects it
+      if (ymodemTransferring) {
+        handleYmodemError({ error: result ? result.error : '未知错误' });
+      }
+    }
+  } catch (e) {
+    handleYmodemError({ error: e.message });
+  }
+}
+
+function handleYmodemProgress(data) {
+  document.getElementById('ymodemFill').style.width = data.percent + '%';
+  document.getElementById('ymodemProgressText').textContent =
+    `${data.percent}% (${formatBytes(data.offset)} / ${formatBytes(data.total)})`;
+}
+
+function handleYmodemLog(data) {
+  const logArea = document.getElementById('ymodemLogArea');
+  const line = document.createElement('div');
+  line.className = `ymodem-log-line ${data.type || 'info'}`;
+  line.innerHTML = `<span class="ymodem-log-time">${data.time || ''}</span><span>${data.message}</span>`;
+  logArea.appendChild(line);
+  logArea.scrollTop = logArea.scrollHeight;
+
+  // Also add important events to main log
+  if (data.type === 'error' || data.type === 'success') {
+    addLog(data.type === 'error' ? 'error' : 'tx', data.message);
+  }
+}
+
+function handleYmodemComplete(data) {
+  ymodemTransferring = false;
+  ymodemCompleted = true;
+
+  // Update progress to 100%
+  document.getElementById('ymodemFill').style.width = '100%';
+  document.getElementById('ymodemFill').className = 'progress-fill';
+
+  // Show step 3 (result)
+  document.getElementById('ymodemStepTransfer').style.display = 'none';
+  document.getElementById('ymodemStepResult').style.display = 'flex';
+  document.getElementById('ymodemResultContent').innerHTML =
+    `<div class="ymodem-result">`
+    + `<div class="ymodem-result-icon">✅</div>`
+    + `<div class="ymodem-result-title success">固件升级成功!</div>`
+    + `<div class="ymodem-result-detail">${data.fileName} (${formatBytes(data.fileSize)})</div>`
+    + `</div>`;
+
+  document.getElementById('btnYmodemCancel').style.display = 'none';
+  addLog('tx', `固件升级完成: ${data.fileName}`);
+}
+
+function handleYmodemError(data) {
+  ymodemTransferring = false;
+
+  // Update progress bar to red
+  document.getElementById('ymodemFill').style.width = '100%';
+  document.getElementById('ymodemFill').className = 'progress-fill paused';
+
+  // Show step 3 (error)
+  document.getElementById('ymodemStepTransfer').style.display = 'none';
+  document.getElementById('ymodemStepResult').style.display = 'flex';
+  document.getElementById('ymodemResultContent').innerHTML =
+    `<div class="ymodem-result">`
+    + `<div class="ymodem-result-icon">❌</div>`
+    + `<div class="ymodem-result-title error">固件升级失败</div>`
+    + `<div class="ymodem-result-detail">${data.error}</div>`
+    + `</div>`;
+
+  document.getElementById('btnYmodemCancel').style.display = 'none';
+  addLog('error', '固件升级失败: ' + data.error);
+}
+
 // ========== Init ==========
 function init() {
   buildChannelGrid();
@@ -1292,7 +1484,36 @@ function init() {
   document.getElementById('btnBatchPause').addEventListener('click', pauseBatchSend);
   document.getElementById('btnBatchStop').addEventListener('click', stopBatchSend);
 
-  addLog('tx', 'SBC测试工具 V3.2 已就绪');
+  // Ymodem firmware upgrade modal
+  document.getElementById('btnYmodemStart').addEventListener('click', startYmodem);
+  document.getElementById('btnYmodemCancel').addEventListener('click', () => {
+    window.sbcAPI.cancelYmodem();
+  });
+  document.getElementById('btnCloseYmodemModal').addEventListener('click', closeYmodemModal);
+  document.getElementById('btnCloseYmodemModal2').addEventListener('click', closeYmodemModal);
+  document.getElementById('btnSelectFirmware').addEventListener('click', selectFirmwareFile);
+  // Close on overlay click (only when not transferring)
+  document.getElementById('ymodemModal').addEventListener('click', (e) => {
+    if (e.target === document.getElementById('ymodemModal') && !ymodemTransferring) {
+      closeYmodemModal();
+    }
+  });
+  // ESC key to close modal (not when transferring)
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape'
+      && document.getElementById('ymodemModal').style.display === 'flex'
+      && !ymodemTransferring) {
+      closeYmodemModal();
+    }
+  });
+
+  // Ymodem IPC event listeners
+  window.sbcAPI.onYmodemProgress(handleYmodemProgress);
+  window.sbcAPI.onYmodemLog(handleYmodemLog);
+  window.sbcAPI.onYmodemComplete(handleYmodemComplete);
+  window.sbcAPI.onYmodemError(handleYmodemError);
+
+  addLog('tx', 'SBC测试工具 V3.3 已就绪');
 }
 
 document.addEventListener('DOMContentLoaded', init);

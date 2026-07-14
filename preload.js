@@ -14,6 +14,11 @@ contextBridge.exposeInMainWorld('sbcAPI', {
   appendTempFile: (text) => ipcRenderer.invoke('append-temp-file', text),
   finishTempFile: () => ipcRenderer.invoke('finish-temp-file'),
 
+  // Ymodem firmware upgrade
+  selectFirmwareFile: () => ipcRenderer.invoke('select-firmware-file'),
+  startYmodem: (filePath) => ipcRenderer.invoke('start-ymodem', filePath),
+  cancelYmodem: () => ipcRenderer.invoke('cancel-ymodem'),
+
   // Events from main
   onSerialData: (callback) => {
     ipcRenderer.on('serial-data', (event, data) => callback(data));
@@ -25,10 +30,28 @@ contextBridge.exposeInMainWorld('sbcAPI', {
     ipcRenderer.on('serial-closed', () => callback());
   },
 
+  // Ymodem events
+  onYmodemProgress: (callback) => {
+    ipcRenderer.on('ymodem-progress', (event, data) => callback(data));
+  },
+  onYmodemLog: (callback) => {
+    ipcRenderer.on('ymodem-log', (event, data) => callback(data));
+  },
+  onYmodemComplete: (callback) => {
+    ipcRenderer.on('ymodem-complete', (event, data) => callback(data));
+  },
+  onYmodemError: (callback) => {
+    ipcRenderer.on('ymodem-error', (event, data) => callback(data));
+  },
+
   // Remove listeners
   removeAllListeners: () => {
     ipcRenderer.removeAllListeners('serial-data');
     ipcRenderer.removeAllListeners('serial-error');
     ipcRenderer.removeAllListeners('serial-closed');
+    ipcRenderer.removeAllListeners('ymodem-progress');
+    ipcRenderer.removeAllListeners('ymodem-log');
+    ipcRenderer.removeAllListeners('ymodem-complete');
+    ipcRenderer.removeAllListeners('ymodem-error');
   }
 });

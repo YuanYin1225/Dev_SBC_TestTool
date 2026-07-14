@@ -4,13 +4,13 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta http-equiv="Content-Security-Policy" content="default-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline';">
-  <title>SBC电磁阀驱动器测试工具 V3.2</title>
+  <title>SBC电磁阀驱动器测试工具 V3.3</title>
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
   <!-- ===== Top Bar: Serial Control ===== -->
   <div id="topBar">
-    <div class="bar-title">SBC 电磁阀驱动器测试工具 <span class="ver">V3.2</span></div>
+    <div class="bar-title">SBC 电磁阀驱动器测试工具 <span class="ver">V3.3</span></div>
     <div class="bar-controls">
       <select id="portSelect">
         <option value="">-- 选择串口 --</option>
@@ -233,6 +233,51 @@
       <div class="modal-footer">
         <button id="btnRefreshFault" class="btn-sm btn-primary" style="width:auto">🔄 刷新查询</button>
         <button id="btnCloseFaultModal2" class="btn-sm" style="width:auto">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== Ymodem Firmware Upgrade Modal ===== -->
+  <div id="ymodemModal" class="modal-overlay" style="display:none">
+    <div class="modal-container ymodem-modal-container">
+      <div class="modal-header">
+        <span class="modal-title">固件升级 (Ymodem)</span>
+        <button id="btnCloseYmodemModal" class="btn-modal-close" title="关闭">✕</button>
+      </div>
+      <div class="modal-body" id="ymodemBody">
+        <!-- Step 1: File Selection -->
+        <div id="ymodemStepSelect" class="ymodem-step">
+          <div class="ymodem-step-title">步骤 1: 选择固件文件</div>
+          <div class="ymodem-file-area">
+            <button id="btnSelectFirmware" class="btn-primary" style="width:auto;padding:10px 24px">📁 选择 .bin 固件文件</button>
+            <div id="ymodemFileInfo" class="ymodem-file-info" style="display:none">
+              <span class="ymodem-file-icon">📦</span>
+              <span id="ymodemFileName"></span>
+              <span class="ymodem-file-size" id="ymodemFileSize"></span>
+            </div>
+          </div>
+        </div>
+        <!-- Step 2: Transfer Progress -->
+        <div id="ymodemStepTransfer" class="ymodem-step" style="display:none">
+          <div class="ymodem-step-title">步骤 2: 固件传输中</div>
+          <div class="ymodem-status-row">
+            <span id="ymodemStatusBadge" class="ymodem-status-badge transferring">传输中...</span>
+          </div>
+          <div class="progress-bar ymodem-progress-bar">
+            <div class="progress-fill" id="ymodemFill"></div>
+          </div>
+          <div class="progress-text" id="ymodemProgressText">0%</div>
+          <div id="ymodemLogArea" class="ymodem-log-area"></div>
+        </div>
+        <!-- Step 3: Result -->
+        <div id="ymodemStepResult" class="ymodem-step" style="display:none">
+          <div id="ymodemResultContent"></div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button id="btnYmodemStart" class="btn-sm btn-primary" style="width:auto" disabled>▶ 开始升级</button>
+        <button id="btnYmodemCancel" class="btn-sm btn-danger" style="width:auto;display:none">⏹ 取消</button>
+        <button id="btnCloseYmodemModal2" class="btn-sm" style="width:auto">关闭</button>
       </div>
     </div>
   </div>
