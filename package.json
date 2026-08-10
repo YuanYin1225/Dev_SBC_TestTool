@@ -1,13 +1,13 @@
 {
   "name": "sbc-test-tool",
   "version": "1.0.0",
-  "description": "SBC电磁阀驱动器测试工具 - V3.2",
+  "description": "SBC电磁阀驱动器测试工具 - V3.3",
   "main": "main.js",
   "author": "SANYI",
   "license": "MIT",
   "scripts": {
     "start": "electron .",
-    "build:win": "set CSC_IDENTITY_AUTO_DISCOVERY=false&& set ELECTRON_BUILDER_BINARIES_MIRROR=https://registry.npmmirror.com/-/binary/electron-builder-binaries/&& electron-builder --win portable",
+    "build:win": "electron-builder --win portable",
     "postinstall": "electron-builder install-app-deps"
   },
   "dependencies": {
@@ -20,6 +20,7 @@
   "build": {
     "appId": "com.sanyi.sbc-test-tool",
     "productName": "SBC测试工具",
+    "asar": false,
     "files": [
       "main.js",
       "preload.js",
