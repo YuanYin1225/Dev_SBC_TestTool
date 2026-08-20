@@ -22,7 +22,7 @@ function createWindow() {
     height: 860,
     minWidth: 1100,
     minHeight: 700,
-    title: 'SBC电磁阀驱动器测试工具 V3.3',
+    title: 'SBC电磁阀驱动器测试工具 ' + app.getVersion(),
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -663,6 +663,21 @@ function parseResponseFrame(frame) {
         V_12VT: V_12VT
       }
     };
+  } else if (dataLen === 0x0F && frame.length >= 15 && frame[4] === 0x87) {
+    // Fault diagnosis config query response: 55 BB 00 0F 87 [faultFlg] [enable_current_check] [enable_tps259_blink] [faultShortCircuitFlg] [faultCurrentOverloadFlg] [fault_ch:4] [CRC]
+    const faultCh = (frame[10] << 24) | (frame[11] << 16) | (frame[12] << 8) | frame[13];
+    return {
+      type: 'diagConfig',
+      crcOk,
+      data: {
+        faultFlg: frame[5],
+        enableCurrentCheck: frame[6],
+        enableTps259Blink: frame[7],
+        faultShortCircuitFlg: frame[8],
+        faultCurrentOverloadFlg: frame[9],
+        faultCh: faultCh
+      }
+    };
   } else if (dataLen === 0x0F && frame.length >= 15) {
     // Real-time data response (15 bytes total)
     // 55 BB 00 0F [ch3] [ch2] [ch1] [ch0] [I_MCU] [I_DCF] [V_12VT] [V_DCF] [V_VCC] [T0] [CRC]
@@ -715,6 +730,8 @@ function parseResponseFrame(frame) {
 }
 
 // ========== IPC Handlers ==========
+ipcMain.handle('get-version', () => app.getVersion());
+
 ipcMain.handle('list-ports', async () => {
   return await listSerialPorts();
 });

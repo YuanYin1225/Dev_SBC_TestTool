@@ -4,13 +4,13 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta http-equiv="Content-Security-Policy" content="default-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline';">
-  <title>SBC电磁阀驱动器测试工具 V3.3</title>
+  <title>SBC电磁阀驱动器测试工具 1.1.0</title>
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
   <!-- ===== Top Bar: Serial Control ===== -->
   <div id="topBar">
-    <div class="bar-title">SBC 电磁阀驱动器测试工具 <span class="ver">V3.3</span></div>
+    <div class="bar-title">SBC 电磁阀驱动器测试工具 <span class="ver">1.1.0</span></div>
     <div class="bar-controls">
       <select id="portSelect">
         <option value="">-- 选择串口 --</option>
@@ -95,6 +95,17 @@
           <button class="btn-action" data-action="faultOff">故障检测关</button>
           <button class="btn-action" data-action="queryLED">故障灯查询</button>
           <span id="ledStatus" class="info-tag">--</span>
+        </div>
+        <!-- 全部故障诊断 -->
+        <div class="action-row">
+          <button class="btn-action" data-action="diagOn">全部诊断开</button>
+          <button class="btn-action" data-action="diagOff">全部诊断关</button>
+          <button class="btn-action" data-action="queryDiag">查询诊断配置</button>
+          <span id="diagStatus" class="info-tag">--</span>
+        </div>
+        <!-- 清除故障码 -->
+        <div class="action-row">
+          <button class="btn-action btn-danger-action" data-action="clearFault">清除故障码</button>
         </div>
         <!-- 故障码查询 -->
         <div class="action-row">

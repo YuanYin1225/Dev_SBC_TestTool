@@ -8,6 +8,7 @@ contextBridge.exposeInMainWorld('sbcAPI', {
   closePort: () => ipcRenderer.invoke('close-port'),
   sendData: (bytes) => ipcRenderer.invoke('send-data', bytes),
   getPortStatus: () => ipcRenderer.invoke('get-port-status'),
+  getVersion: () => ipcRenderer.invoke('get-version'),
 
   // Temp file (streaming large CSV to disk)
   startTempFile: (filename) => ipcRenderer.invoke('start-temp-file', filename),

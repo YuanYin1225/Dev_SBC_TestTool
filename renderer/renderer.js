@@ -493,6 +493,11 @@ const ACTION_COMMANDS = {
   // 故障检测 / KZ 指示灯控制 → 0xA0（写入 Flash 掉电保存）
   faultOn: { subCmd: 0xA0, extra: 0x01, label: '开启故障检测' },
   faultOff: { subCmd: 0xA0, extra: 0x00, label: '关闭故障检测' },
+  // 全部故障诊断总开关 / 清除故障码 / 查询诊断配置 → 新协议 0x86 / 0x85 / 0x87
+  diagOn: { subCmd: 0x86, extra: 0x01, label: '全部诊断开' },
+  diagOff: { subCmd: 0x86, extra: 0x00, label: '全部诊断关' },
+  clearFault: { subCmd: 0x85, extra: 0x00, label: '清除故障码' },
+  queryDiag: { subCmd: 0x87, extra: 0x00, label: '查询诊断配置' },
   bootloader: { subCmd: 0x2B, label: '设备复位/升级' }
 };
 
@@ -509,6 +514,12 @@ async function quickAction(actionName) {
   }
   if (actionName === 'faultOff') {
     if (!confirm('关闭故障检测将使设备忽略电磁阀故障，确保安全后继续？')) return;
+  }
+  if (actionName === 'diagOff') {
+    if (!confirm('关闭全部故障诊断将使设备忽略短路/过载/电磁阀故障，确保安全后继续？')) return;
+  }
+  if (actionName === 'clearFault') {
+    if (!confirm('确认清除设备中记录的全部故障码？')) return;
   }
 
   // 特殊帧格式：固件查询(0x2D)和Bootloader(0x2B)使用 7 字节相同值
@@ -588,6 +599,23 @@ function handleSerialData(data) {
     }
     // Update raw data field
     document.getElementById('faultRawData').textContent = hex;
+  } else if (parsed.type === 'diagConfig' && parsed.data) {
+    const d = parsed.data;
+    const onOff = (v) => (v ? '开' : '关');
+    const faultChHex = (d.faultCh >>> 0).toString(16).padStart(8, '0').toUpperCase();
+    const hasFault = d.faultShortCircuitFlg !== 0 || d.faultCurrentOverloadFlg !== 0 || d.faultCh !== 0;
+    detail = `诊断配置: 总开关${onOff(d.faultFlg)} 电流检测${onOff(d.enableCurrentCheck)} 短路闪烁${onOff(d.enableTps259Blink)}`
+      + ` 短路故障${onOff(d.faultShortCircuitFlg)} 过载故障${onOff(d.faultCurrentOverloadFlg)} fault_ch=0x${faultChHex}`;
+    const diagEl = document.getElementById('diagStatus');
+    if (diagEl) {
+      diagEl.textContent = `总${onOff(d.faultFlg)} 流检${onOff(d.enableCurrentCheck)} 闪${onOff(d.enableTps259Blink)} 故障: ${hasFault ? '⚠ ' + faultChHex : '✓'}`;
+      diagEl.style.color = hasFault ? '#f85149' : '#3fb950';
+    }
+    const hintEl = document.getElementById('faultQueryHint');
+    if (hintEl) {
+      hintEl.textContent = hasFault ? '⚠ 设备存在故障!' : '✓ 设备正常';
+      hintEl.style.color = hasFault ? '#f85149' : '#3fb950';
+    }
   } else if (parsed.type === 'text' && parsed.text) {
     const crcInfo = parsed.crcOk ? ' ✓' : ' ⚠CRC';
     const isFW = (parsed.source === 'firmware');
@@ -823,6 +851,9 @@ async function generateCommands(n) {
         document.getElementById('genResult').style.display = 'flex';
         document.getElementById('genCount').textContent = `共 ${genTotalCount.toLocaleString()} 条指令（文件已自动打开）`;
         addLog('tx', `导出完成: ${filename} (${genTotalCount.toLocaleString()}条)`);
+        if (genTempFile) {
+          addLog('tx', `文件路径: ${genTempFile}`);
+        }
         resolve();
       }
     }
@@ -1513,7 +1544,13 @@ function init() {
   window.sbcAPI.onYmodemComplete(handleYmodemComplete);
   window.sbcAPI.onYmodemError(handleYmodemError);
 
-  addLog('tx', 'SBC测试工具 V3.3 已就绪');
+  // 应用版本号（与打包文件名一致，来自 package.json），并记录就绪日志
+  window.sbcAPI.getVersion().then(ver => {
+    document.title = `SBC电磁阀驱动器测试工具 ${ver}`;
+    const verEl = document.querySelector('.bar-title .ver');
+    if (verEl) verEl.textContent = ver;
+    addLog('tx', `SBC测试工具 ${ver} 已就绪`);
+  });
 }
 
 document.addEventListener('DOMContentLoaded', init);
