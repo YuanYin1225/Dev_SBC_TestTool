@@ -330,7 +330,7 @@ async function executeYmodemTransfer(portPath, filePath) {
     // --- Step 6: Wait for 'C' (0x43) from bootloader ---
     sendYmodemLog('等待 Bootloader 发送 C (0x43)...', 'info');
     try {
-      await readUntilByte(MODEM_C, 15000);  // 15-second timeout
+      await readUntilByte(MODEM_C, 25000);  // 25-second timeout
     } catch (e) {
       sendYmodemLog('错误: 未收到 Bootloader 响应，请确认设备已进入升级模式', 'error');
       throw new Error('未收到 Bootloader 响应 (超时等待 C)');
@@ -348,7 +348,7 @@ async function executeYmodemTransfer(portPath, filePath) {
       let gotAck = false;
       let gotC = false;
       const startTime = Date.now();
-      const timeout = 10000;
+      const timeout = 25000;
 
       while (!gotAck || !gotC) {
         if (Date.now() - startTime > timeout) {
@@ -356,7 +356,7 @@ async function executeYmodemTransfer(portPath, filePath) {
         }
         if (ymodemAbortFlag) throw new Error('传输取消');
 
-        const byte = await readNextByte(3000);
+        const byte = await readNextByte(5000);
         if (byte === ACK && !gotAck) {
           gotAck = true;
           sendYmodemLog('收到 ACK (0x06)', 'success');
@@ -380,7 +380,7 @@ async function executeYmodemTransfer(portPath, filePath) {
 
     // --- Step 8: Send data packets ---
     sendYmodemLog('开始发送固件数据...', 'info');
-    const MAX_RETRIES = 3;
+    const MAX_RETRIES = 8;
 
     while (!sender.isComplete()) {
       if (ymodemAbortFlag) {
@@ -412,11 +412,12 @@ async function executeYmodemTransfer(portPath, filePath) {
       // Wait for 'C' (0x43) response, with retry on NAK
       let retryCount = 0;
       let gotResponse = false;
+      let strayCount = 0;
       while (!gotResponse && retryCount <= MAX_RETRIES) {
         if (ymodemAbortFlag) throw new Error('传输取消');
 
         try {
-          const byte = await readNextByte(5000);
+          const byte = await readNextByte(15000);
           if (byte === MODEM_C) {
             gotResponse = true;
           } else if (byte === NAK) {
@@ -429,7 +430,11 @@ async function executeYmodemTransfer(portPath, filePath) {
           } else if (byte === CA) {
             throw new Error('设备请求取消传输 (CA)');
           } else {
-            sendYmodemLog(`收到意外字节: 0x${byte.toString(16).toUpperCase()}，忽略`, 'warning');
+            // 非协议字节多为 Boot 的 printf 文本输出（版本信息/错误提示），聚合提示避免刷屏
+            strayCount++;
+            if (strayCount === 1 || strayCount % 100 === 0) {
+              sendYmodemLog(`收到非协议字节 ${strayCount} 个（可能为 Boot 文本输出），忽略...`, 'warning');
+            }
           }
         } catch (e) {
           if (retryCount >= MAX_RETRIES) {
@@ -440,6 +445,9 @@ async function executeYmodemTransfer(portPath, filePath) {
           sendYmodemLog(`超时，重发 (${retryCount}/${MAX_RETRIES})...`, 'warning');
           await ymodemWrite(packet);
         }
+      }
+      if (strayCount > 0) {
+        sendYmodemLog(`本包共忽略非协议字节 ${strayCount} 个`, 'info');
       }
     }
 
