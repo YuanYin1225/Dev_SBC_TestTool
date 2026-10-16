@@ -888,6 +888,13 @@ let batchHoldCount = 0;        // 当前保持阶段已发送次数
 let batchInGap = false;        // 是否在间隔等待中
 let csvLoadCancelled = false;
 
+// ---- 通道保活相关(20261016) ----
+// 设备端 APP 收到有效通道指令后只保持 CH_HOLD_TICKS(0x1f tick ≈ 316ms), 超时即自动清零通道
+// (电磁阀断开 + 指示灯转绿)。因此主机必须保证发送周期显著小于该窗口。
+const DEVICE_HOLD_MS = 316;
+let batchMaxSendGap = 0;           // 保持期内最大发送间隔(来自主进程保活统计)
+let batchGapWarned = false;        // 保活间隔告警只报一次, 避免刷屏
+
 function parseHexLine(line) {
   // Parse a hex string like "55 AA 00 09 00 00 00 30 38" into byte array
   const parts = line.trim().split(/\s+/);
@@ -1067,6 +1074,23 @@ function loadCSVFiles(files) {
 const ALL_OFF_CMD = [0x55, 0xAA, 0x00, 0x09, 0x00, 0x00, 0x00, 0x00, 0x08];
 const ALL_OFF_HEX = formatHex(ALL_OFF_CMD);
 
+// 主进程保活进度: 更新"已发次数"与最大间隔统计(次数由主进程统计, 不受渲染进程卡顿影响)
+function handleKeepAliveProgress(data) {
+  if (!data) return;
+  if (data.stopped) {
+    addLog('error', `保活重发已停止: ${data.reason || ''}`);
+    return;
+  }
+  if (typeof data.sent === 'number' && data.sent > 0) batchHoldCount = data.sent;
+  if (typeof data.maxGap === 'number' && data.maxGap > batchMaxSendGap) {
+    batchMaxSendGap = data.maxGap;
+    if (data.maxGap > DEVICE_HOLD_MS * 0.8 && !batchGapWarned) {
+      batchGapWarned = true;
+      addLog('warn', `⚠ 保活间隔 ${data.maxGap}ms 接近设备窗口 ${DEVICE_HOLD_MS}ms`, '通道可能被设备自动关断');
+    }
+  }
+}
+
 function startBatchSend() {
   if (!isConnected) { addLog('error', '请先连接串口'); return; }
   if (batchCommands.length === 0) { addLog('error', '没有可发送的指令'); return; }
@@ -1074,6 +1098,20 @@ function startBatchSend() {
   batchIndex = 0;
   batchPaused = false;
   batchInGap = false;
+  batchMaxSendGap = 0;
+  batchGapWarned = false;
+
+  // 批量发送期间暂停 1s 周期的实时查询, 避免与保活报文抢占串口(并在设备端产生额外报文)
+  stopAutoQuery();
+
+  // 保活余量检查: 设备端约 316ms 收不到通道指令就会自动关断通道
+  const _freq = parseInt(document.getElementById('batchFreqHz').value) || 5;
+  const _periodMs = Math.round(1000 / Math.max(1, Math.min(10, _freq)));
+  if (_periodMs > DEVICE_HOLD_MS * 0.7) {
+    addLog('warn', `⚠ 发送周期 ${_periodMs}ms 接近设备保活窗口 ${DEVICE_HOLD_MS}ms`,
+      '设备端窗口不允许放宽(影响通道关断精度), 建议把发送频率设为 10 次/s(100ms)');
+  }
+
   document.getElementById('batchProgress').style.display = 'block';
   document.getElementById('btnBatchStart').textContent = '▶ 运行中';
   document.getElementById('btnBatchStart').disabled = true;
@@ -1081,7 +1119,7 @@ function startBatchSend() {
   sendHoldCycle();
 }
 
-function sendHoldCycle() {
+async function sendHoldCycle() {
   if (batchPaused) return;
   if (batchIndex >= batchCommands.length) { batchSendComplete(); return; }
 
@@ -1091,7 +1129,6 @@ function sendHoldCycle() {
   const holdSec = parseInt(document.getElementById('batchHoldSec').value) || 5;
   const gapSec = parseInt(document.getElementById('batchGapSec').value) || 2;
   const holdMs = holdSec * 1000;
-  const gapMs = gapSec * 1000;
 
   batchInGap = false;
   batchHoldStart = Date.now();
@@ -1100,49 +1137,72 @@ function sendHoldCycle() {
   // 显示当前指令
   document.getElementById('batchCmdPreview').textContent = `[${batchIndex+1}/${batchCommands.length}] ${cmd.hex}`;
 
-  function holdLoop() {
-    if (batchPaused) return;
+  // 保活报文交给主进程按单调时钟重发(见 main.js kaLoop):
+  //   设备端只有约 316ms 的通道保活窗口, 时序必须稳;
+  //   主进程排程不受渲染进程 GC/DOM 卡顿与窗口失焦节流影响, 也省掉每帧一次 IPC 往返。
+  // 渲染进程只负责换帧/停帧与界面刷新, 保活不依赖渲染进程的定时器。
+  let kaRes = { success: false, error: 'unknown' };
+  try {
+    kaRes = await window.sbcAPI.keepAliveStart(cmd.bytes, repeatMs);
+  } catch (e) {
+    kaRes = { success: false, error: e.message };
+  }
+  if (!kaRes || !kaRes.success) {
+    addLog('error', `保活重发启动失败: ${(kaRes && kaRes.error) || 'unknown'}`, '通道可能因超时被设备自动关断');
+  } else {
+    addLog('tx', cmd.hex, `[${batchIndex+1}/${batchCommands.length}] 保持 ${holdSec}s @ ${freqHz}次/s (主进程保活)`);
+  }
 
-    const elapsed = Date.now() - batchHoldStart;
-    if (elapsed >= holdMs) {
-      // 保持结束 → 进入间隔，主动发送全关指令关断电磁阀
-      batchInGap = true;
-      let gapRemaining = gapSec;
-      updateBatchProgressHolding(batchIndex + 1, batchCommands.length, gapRemaining, batchHoldCount);
-
-      function gapTick() {
-        if (batchPaused) return;
-        gapRemaining--;
-        if (gapRemaining <= 0) {
-          batchIndex++;
-          sendHoldCycle();  // 下一组
-          return;
+  // 进入间隔: 先停保活, 再发全关
+  function enterGap() {
+    batchInGap = true;
+    window.sbcAPI.keepAliveStop().then((st) => {
+      if (st && typeof st.maxGap === 'number') {
+        if (st.maxGap > batchMaxSendGap) batchMaxSendGap = st.maxGap;
+        if (st.maxGap > DEVICE_HOLD_MS * 0.8 && !batchGapWarned) {
+          batchGapWarned = true;
+          addLog('warn', `⚠ 本组保活最大间隔 ${st.maxGap}ms 接近设备窗口 ${DEVICE_HOLD_MS}ms`, '通道可能被设备自动关断');
         }
-        // 间隔期间周期发送全关指令，确保设备真正关断
-        window.sbcAPI.sendData(ALL_OFF_CMD).catch(() => {});
-        updateBatchProgressHolding(batchIndex + 1, batchCommands.length, gapRemaining, batchHoldCount);
-        batchHoldTimer = setTimeout(gapTick, 1000);
       }
-      // 进入间隔立即发一次全关
+    }).catch(() => {});
+
+    let gapRemaining = gapSec;
+    updateBatchProgressHolding(batchIndex + 1, batchCommands.length, gapRemaining, batchHoldCount);
+    // 进入间隔立即发一次全关, 确保设备真正关断
+    window.sbcAPI.sendData(ALL_OFF_CMD).catch(() => {});
+
+    function gapTick() {
+      if (batchPaused) return;
+      gapRemaining--;
+      if (gapRemaining <= 0) {
+        batchIndex++;
+        sendHoldCycle();  // 下一组
+        return;
+      }
+      // 间隔期间周期发送全关指令
       window.sbcAPI.sendData(ALL_OFF_CMD).catch(() => {});
+      updateBatchProgressHolding(batchIndex + 1, batchCommands.length, gapRemaining, batchHoldCount);
       batchHoldTimer = setTimeout(gapTick, 1000);
-      return;
     }
-
-    // 发送当前指令
-    batchHoldCount++;
-    window.sbcAPI.sendData(cmd.bytes).then(() => {
-      addBatchLog(batchIndex + 1, batchCommands.length, cmd.hex);
-    }).catch(err => { addLog('error', `发送失败: ${err.message}`); });
-
-    updateBatchProgressHolding(batchIndex + 1, batchCommands.length,
-      Math.round(elapsed / 1000), batchHoldCount);
-
-    if (!batchPaused) {
-      batchHoldTimer = setTimeout(holdLoop, repeatMs);
+    if (gapSec > 0) {
+      batchHoldTimer = setTimeout(gapTick, 1000);
+    } else {
+      batchIndex++;
+      sendHoldCycle();
     }
   }
-  holdLoop();
+
+  // 界面刷新: 只负责倒计时显示与阶段切换, 保活不依赖本定时器
+  function uiTick() {
+    if (batchPaused) return;
+    const elapsed = Date.now() - batchHoldStart;
+    if (elapsed >= holdMs) { enterGap(); return; }
+    updateBatchProgressHolding(batchIndex + 1, batchCommands.length,
+      Math.round(elapsed / 1000), batchHoldCount);
+    batchHoldTimer = setTimeout(uiTick, 200);
+  }
+  updateBatchProgressHolding(batchIndex + 1, batchCommands.length, 0, 0);
+  batchHoldTimer = setTimeout(uiTick, 200);
 }
 
 function updateBatchProgressHolding(idx, total, holdSecElapsed, sentCount) {
@@ -1168,6 +1228,7 @@ function pauseBatchSend() {
   if (batchPaused) {
     btn.textContent = '▶ 继续';
     if (batchHoldTimer) { clearTimeout(batchHoldTimer); batchHoldTimer = null; }
+    window.sbcAPI.keepAliveStop().catch(() => {});   // 暂停即停止保活重发
     document.getElementById('batchFill').className = 'progress-fill paused';
   } else {
     btn.textContent = '⏸ 暂停';
@@ -1186,13 +1247,20 @@ function stopBatchSend() {
   csvLoadCancelled = true;  // 同时取消正在进行的 CSV 加载
   batchPaused = false;
   if (batchHoldTimer) { clearTimeout(batchHoldTimer); batchHoldTimer = null; }
+  window.sbcAPI.keepAliveStop().catch(() => {});
   batchIndex = batchCommands.length;
   batchSendComplete();
 }
 
 function batchSendComplete() {
   if (batchHoldTimer) { clearTimeout(batchHoldTimer); batchHoldTimer = null; }
+  window.sbcAPI.keepAliveStop().catch(() => {});
   batchInGap = false;
+  if (batchMaxSendGap > 0) {
+    addLog('tx', `保活统计: 保持期内最大发送间隔 ${batchMaxSendGap}ms (设备窗口 ${DEVICE_HOLD_MS}ms)`);
+    batchMaxSendGap = 0;
+  }
+  startAutoQuery();   // 恢复自动查询(仅当勾选且已连接)
   document.getElementById('btnBatchStart').textContent = '▶ 开始';
   document.getElementById('btnBatchStart').disabled = false;
   document.getElementById('btnBatchPause').textContent = '⏸ 暂停';
@@ -1392,8 +1460,14 @@ function init() {
   updateCommandPreview();
   refreshPorts();
 
-  // Periodic port refresh
-  setInterval(refreshPorts, 3000);
+  // 端口自动刷新: SerialPort.list() 在 Windows 上是较重的原生枚举调用,
+  // 在主进程执行时可能造成上百毫秒的卡顿, 使保活报文延迟超过设备端 316ms 窗口
+  // (表现为"保持期内通道被关断+绿灯")。因此连接状态下(含批量发送期间)跳过自动刷新,
+  // 只保留手动刷新按钮; 间隔也从 3s 放宽到 10s。
+  setInterval(() => {
+    if (isConnected) return;    // 已连接: 端口表不需要刷新, 避免干扰保活报文
+    refreshPorts();
+  }, 10000);
 
   // Connect/Disconnect
   document.getElementById('btnConnect').addEventListener('click', () => {
@@ -1463,6 +1537,7 @@ function init() {
 
   // Serial data listener
   window.sbcAPI.onSerialData(handleSerialData);
+  window.sbcAPI.onKeepAliveProgress(handleKeepAliveProgress);
 
   window.sbcAPI.onSerialError((msg) => {
     addLog('error', '串口错误: ' + msg);

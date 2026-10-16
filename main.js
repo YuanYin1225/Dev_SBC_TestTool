@@ -26,7 +26,11 @@ function createWindow() {
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
-      nodeIntegration: false
+      nodeIntegration: false,
+      // 批量发送的通道保活依赖 200ms 级定时器(设备端约 316ms 收不到通道指令就会自动关断)。
+      // Chromium 默认在窗口失焦/被遮挡/最小化时把定时器节流到 >=1000ms,
+      // 会造成"保持期内通道被关断、指示灯转绿", 因此必须显式关闭后台节流。
+      backgroundThrottling: false
     }
   });
 
@@ -213,7 +217,82 @@ function openSerialPort(portPath, options = {}) {
   });
 }
 
+/** Byte array (or null to stop). Kept as Buffer for zero-copy writes. */
+let kaBytes = null;
+let kaIntervalMs = 200;
+let kaTimer = null;
+let kaNextAt = 0;
+let kaSent = 0;
+let kaMaxGap = 0;
+let kaLastAt = 0;
+
+/** Stop the keep-alive repeater. Returns the statistics of the last run. */
+function kaStop() {
+  if (kaTimer) { clearTimeout(kaTimer); kaTimer = null; }
+  kaBytes = null;
+  const stat = { sent: kaSent, maxGap: kaMaxGap };
+  kaSent = 0;
+  kaMaxGap = 0;
+  kaLastAt = 0;
+  return stat;
+}
+
+/**
+ * 批量发送的通道保活重发(主进程, 单调时钟排程)。
+ *
+ * 设备端 APP 收到一条通道指令后只保持约 316ms(见 APP main.h CH_HOLD_TICKS),
+ * 超时即自动清零通道 → 电磁阀断开 + 指示灯转绿。因此保活报文的时序必须稳：
+ *   - Node 侧定时器不受渲染进程 GC / DOM 卡顿影响;
+ *   - 不需要每帧 renderer -> main 的 IPC 往返(旧实现每 200ms 一次);
+ *   - 与窗口是否失焦/被遮挡无关(渲染进程仍保留 backgroundThrottling: false 作为双保险)。
+ * 渲染进程只负责"换帧"(下一组指令)与"停帧"(间隔期/停止), 并用 ka-progress 事件显示统计。
+ */
+function kaLoop() {
+  kaTimer = null;
+  if (!kaBytes) return;
+
+  if (!serialPort || !serialPort.isOpen) {
+    kaStop();
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('ka-progress', { stopped: true, reason: '串口未打开' });
+    }
+    return;
+  }
+
+  const now = Date.now();
+  if (kaLastAt > 0) {
+    const gap = now - kaLastAt;
+    if (gap > kaMaxGap) kaMaxGap = gap;
+  }
+  kaLastAt = now;
+  serialPort.write(kaBytes, () => {});   // 不等回调, 由单调时钟继续排下一拍
+  kaSent++;
+
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('ka-progress', { sent: kaSent, maxGap: kaMaxGap });
+  }
+
+  // 自校正: 下一拍 = 起点 + n*周期; 已过期则立即补发, 不累积漂移
+  kaNextAt += kaIntervalMs;
+  const due = kaNextAt - Date.now();
+  kaTimer = setTimeout(kaLoop, due > 0 ? due : 0);
+}
+
+/** Start (or restart) the repeater with a new frame. */
+function kaStart(byteArray, intervalMs) {
+  kaBytes = Buffer.from(byteArray);
+  const iv = parseInt(intervalMs, 10);
+  kaIntervalMs = Math.max(50, Math.min(1000, isNaN(iv) ? 200 : iv));
+  kaSent = 0;
+  kaMaxGap = 0;
+  kaLastAt = 0;
+  kaNextAt = Date.now();
+  if (kaTimer) { clearTimeout(kaTimer); kaTimer = null; }
+  kaLoop();
+}
+
 function closeSerialPort() {
+  kaStop();
   if (serialPort && serialPort.isOpen) {
     try {
       serialPort.close();
@@ -766,6 +845,25 @@ ipcMain.handle('send-data', async (event, byteArray) => {
   } catch (err) {
     return { success: false, error: err.message };
   }
+});
+
+ipcMain.handle('ka-start', async (event, byteArray, intervalMs) => {
+  try {
+    if (!serialPort || !serialPort.isOpen) return { success: false, error: '串口未打开' };
+    kaStart(byteArray, intervalMs);
+    return { success: true };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+});
+
+ipcMain.handle('ka-update', async (event, byteArray) => {
+  kaBytes = Buffer.from(byteArray);
+  return { success: true };
+});
+
+ipcMain.handle('ka-stop', async () => {
+  return Object.assign({ success: true }, kaStop());
 });
 
 ipcMain.handle('get-port-status', async () => {

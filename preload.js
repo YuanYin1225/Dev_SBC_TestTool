@@ -7,6 +7,11 @@ contextBridge.exposeInMainWorld('sbcAPI', {
   openPort: (path) => ipcRenderer.invoke('open-port', path),
   closePort: () => ipcRenderer.invoke('close-port'),
   sendData: (bytes) => ipcRenderer.invoke('send-data', bytes),
+
+  // 批量保活重发(主进程定时, 不受渲染进程卡顿/窗口后台节流影响)
+  keepAliveStart: (bytes, intervalMs) => ipcRenderer.invoke('ka-start', bytes, intervalMs),
+  keepAliveUpdate: (bytes) => ipcRenderer.invoke('ka-update', bytes),
+  keepAliveStop: () => ipcRenderer.invoke('ka-stop'),
   getPortStatus: () => ipcRenderer.invoke('get-port-status'),
   getVersion: () => ipcRenderer.invoke('get-version'),
 
@@ -30,6 +35,9 @@ contextBridge.exposeInMainWorld('sbcAPI', {
   onSerialClosed: (callback) => {
     ipcRenderer.on('serial-closed', () => callback());
   },
+  onKeepAliveProgress: (callback) => {
+    ipcRenderer.on('ka-progress', (event, data) => callback(data));
+  },
 
   // Ymodem events
   onYmodemProgress: (callback) => {
@@ -50,6 +58,7 @@ contextBridge.exposeInMainWorld('sbcAPI', {
     ipcRenderer.removeAllListeners('serial-data');
     ipcRenderer.removeAllListeners('serial-error');
     ipcRenderer.removeAllListeners('serial-closed');
+    ipcRenderer.removeAllListeners('ka-progress');
     ipcRenderer.removeAllListeners('ymodem-progress');
     ipcRenderer.removeAllListeners('ymodem-log');
     ipcRenderer.removeAllListeners('ymodem-complete');

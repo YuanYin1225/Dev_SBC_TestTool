@@ -103,6 +103,7 @@ input { width:100%; }
 .log-entry .hex { color:#c9d1d9; }
 .log-entry .detail { color:#8b949e; margin-left:8px; }
 .log-entry.error { color:#f85149; }
+.log-entry.warn { color:#d29922; }
 
 /* ===== Command Preview ===== */
 #cmdPreview { font-family:"Cascadia Code","Consolas",monospace; font-size:11px;
