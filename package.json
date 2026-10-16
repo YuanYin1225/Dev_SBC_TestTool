@@ -1,7 +1,7 @@
 {
   "name": "sbc-test-tool",
-  "version": "1.2.0",
-  "description": "SBC电磁阀驱动器测试工具 - 1.2.0",
+  "version": "1.2.1",
+  "description": "SBC电磁阀驱动器测试工具 - 1.2.1",
   "main": "main.js",
   "author": "SANYI",
   "license": "MIT",
@@ -30,6 +30,7 @@
     ],
     "win": {
       "target": "portable",
+      "icon": "build/icon.ico",
       "sign": false,
       "signDlls": false,
       "signAndEditExecutable": false

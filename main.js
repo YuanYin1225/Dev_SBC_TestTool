@@ -16,6 +16,10 @@ let ymodemAbortFlag = false;  // 取消传输标志
 let ymodemHandler = null;     // Ymodem 接收数据处理回调
 
 // ========== Window ==========
+// 窗口图标: 开发模式(npm start)下 Windows 会显示 Electron 默认图标,
+// 这里显式指定自己的图标; 打包后的 exe 图标由 build/icon.ico 写入可执行文件资源。
+const APP_ICON = path.join(__dirname, 'renderer', 'icon.png');
+
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1280,
@@ -23,6 +27,7 @@ function createWindow() {
     minWidth: 1100,
     minHeight: 700,
     title: 'SBC电磁阀驱动器测试工具 ' + app.getVersion(),
+    icon: fs.existsSync(APP_ICON) ? APP_ICON : undefined,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
